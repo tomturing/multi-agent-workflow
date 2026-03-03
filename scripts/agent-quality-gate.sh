@@ -23,6 +23,12 @@ PASS=0
 FAIL=0
 SKIP=0
 
+# 加载 VK 工作流钩子（如果存在）
+VK_HOOKS="${PROJECT_ROOT}/scripts/vk-hooks.sh"
+if [ -f "$VK_HOOKS" ]; then
+    source "$VK_HOOKS"
+fi
+
 # 报告文件
 REPORT_FILE="${PROJECT_ROOT}/.vk/reports/quality-gate-$(date +%Y%m%d-%H%M%S).txt"
 mkdir -p "$(dirname "$REPORT_FILE")"
@@ -153,7 +159,8 @@ check_python_test() {
 check_frontend_lint() {
     log_header "前端 Lint 检查"
 
-    if [ ! -d "frontend/node_modules" ]; then
+    # 检查是否真正安装了前端依赖（仅有 .pnpm-workspace-state 不算）
+    if [ ! -d "frontend/node_modules/.pnpm" ]; then
         log_skip "前端依赖未安装（运行 'cd frontend && pnpm install'）"
         return
     fi
@@ -162,6 +169,11 @@ check_frontend_lint() {
 
     for app_dir in frontend/customer frontend/admin; do
         if [ -f "${app_dir}/package.json" ]; then
+            # 检查 package.json 是否定义了 lint 脚本
+            if ! grep -q '"lint"' "${app_dir}/package.json" 2>/dev/null; then
+                log_skip "${app_dir} lint — 未定义 lint 脚本"
+                continue
+            fi
             if (cd "$app_dir" && pnpm lint 2>/dev/null); then
                 log_pass "${app_dir} lint — 通过"
             else
@@ -226,9 +238,17 @@ main() {
 
     if [ $FAIL -gt 0 ]; then
         echo -e "\n  ${RED}质量门禁未通过！请修复上述问题后重试。${NC}"
+        # 触发 VK 失败钩子
+        if type vk_on_cleanup_failure &>/dev/null; then
+            vk_on_cleanup_failure
+        fi
         exit 1
     else
         echo -e "\n  ${GREEN}质量门禁全部通过 ✓${NC}"
+        # 触发 VK 成功钩子 — 自动将 Issue 状态流转到 "In review"
+        if type vk_on_cleanup_success &>/dev/null; then
+            vk_on_cleanup_success
+        fi
         exit 0
     fi
 }
