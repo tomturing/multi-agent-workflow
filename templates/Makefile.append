@@ -1,0 +1,22 @@
+
+# ============================================================================
+# 多 Agent 工作流命令（由 multi-agent-workflow init.sh 自动添加）
+# ============================================================================
+
+.PHONY: vk quality-gate conflict-check post-merge
+
+vk:
+	@echo "启动 Vibe Kanban..."
+	npx vibe-kanban
+
+quality-gate:
+	@echo "运行质量门禁..."
+	bash scripts/agent-quality-gate.sh
+
+conflict-check:
+	@echo "运行 Worktree 冲突预检..."
+	bash scripts/check-worktree-conflicts.sh
+
+post-merge:
+	@echo "运行合并后集成验证..."
+	bash scripts/post-merge-verify.sh

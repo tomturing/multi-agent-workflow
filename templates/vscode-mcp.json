@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "vibe_kanban": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "vibe-kanban@latest", "--mcp"]
+    }
+  }
+}
