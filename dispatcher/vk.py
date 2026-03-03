@@ -58,7 +58,8 @@ class VKRestClient:
         )
         resp = urllib.request.urlopen(url, timeout=10)
         data = json.loads(resp.read().decode())
-        return data.get("issues", [])
+        # VK REST API 响应结构: {success: true, data: {issues: [...]}}
+        return data.get("data", {}).get("issues", [])
 
     def update_issue_status(
         self, issue_id: str, status_name: str, status_map: dict[str, str]

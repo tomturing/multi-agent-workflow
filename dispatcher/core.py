@@ -182,6 +182,12 @@ class Dispatcher:
         self._action_count = 0
         self._error_count = 0
 
+        # 反向 status_map: status_id (UUID) → status 名称
+        # VK REST API 返回 status_id，不返回状态名称
+        self._status_id_to_name: dict[str, str] = {
+            v: k for k, v in config.status_map.items()
+        }
+
         self._load_state()
 
     # ---- 主循环 ----
@@ -226,7 +232,9 @@ class Dispatcher:
 
         for issue in issues:
             issue_id = issue["id"]
-            new_status = issue.get("status", "")
+            # VK REST API 只返回 status_id，通过反向 map 解析为状态名称
+            status_id = issue.get("status_id", "")
+            new_status = self._status_id_to_name.get(status_id, status_id)
             title = issue.get("title", "")
             simple_id = issue.get("simple_id", "")
 
@@ -267,8 +275,8 @@ class Dispatcher:
             # 触发相应动作
             self._handle_transition(issue_id, issue, old_status, new_status, trace_id)
 
-        if transitions > 0:
-            self._save_state()
+        # 每轮结束都持久化，保证补偿检查跨进程生效（首次发现 + 状态变化均覆盖）
+        self._save_state()
 
         logger.info(
             "[%s] 轮询 #%d: %d issues, %d 变化 (累计: %d 动作, %d 错误)",
@@ -311,6 +319,16 @@ class Dispatcher:
         场景: 调度器在动作执行中途崩溃重启，或启动时 Issue 已在某状态
         """
         t = self._trackers[issue_id]
+
+        # To do 且无编码 Session → 补偿启动编码（冷启动时 To do 已存在的 issue）
+        if (
+            t.status == "To do"
+            and self.config.auto_start_coding
+            and not t.coding_workspace_id
+        ):
+            logger.info("[%s] ▸ %s: 补偿 — To do 但无编码 Session", trace_id, t.simple_id)
+            self._action_start_coding(issue_id, issue, trace_id)
+            return  # 已触发，不继续检查其他补偿
 
         # In review 但无 PR → 补偿创建 PR
         if (
