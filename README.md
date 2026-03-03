@@ -34,8 +34,8 @@
 ┌────────────────────────────────────────────────────┐
 │           Dispatcher (中央调度守护进程)              │
 │  轮询 VK REST API → 检测状态变化 → 触发编排动作      │
-│  To do → 编码Session │ In review → 审查Session      │
-│  Done → 合并主分支   │ 交叉审查矩阵                  │
+│  To do → 编码Session │ In review → 创建PR + 审查     │
+│  Done → GitHub Merge PR │ 交叉审查矩阵               │
 └───────┬────────────┬────────────┬──────────────────┘
         ▼            ▼            ▼
    ┌──────────┐  ┌──────────┐  ┌──────────┐
@@ -46,10 +46,10 @@
    │ worktree │  │ worktree │  │ worktree │
    └────┬─────┘  └────┬─────┘  └────┬─────┘
         │              │              │
-        └── cleanup 钩子 → 质量门禁 → 状态更新 ──┐
-                                                │
-            Dispatcher 检测状态变化 ←────────────┘
-              → 创建交叉审查 / 合并 / Done
+        └── cleanup 钩子 → 质量门禁 → push 分支 → 状态更新 ──┐
+                                                            │
+            Dispatcher 检测状态变化 ←────────────────────────┘
+              → 创建 PR → 交叉审查(注入 diff) → Merge PR
 ```
 
 ## 快速开始
@@ -105,6 +105,7 @@ multi-agent-workflow/
 │   ├── __init__.py
 │   ├── __main__.py                 # CLI: python -m dispatcher
 │   ├── core.py                     # 轮询引擎 + 状态机 + 编排动作
+│   ├── github.py                   # GitHub REST API v3 客户端（PR 生命周期）
 │   └── vk.py                       # VK REST API + MCP stdio 客户端
 ├── templates/
 │   ├── CLAUDE.md.tmpl              # 项目 CLAUDE.md 模板（含占位符变量）
@@ -161,10 +162,11 @@ my-project/
 | 任务创建 | Copilot (VK MCP) | `create_task` → Issue To do | 人工/半自动 |
 | 编码启动 | **Dispatcher** | 检测 To do → 创建编码 Session | 可选自动 |
 | 并行编码 | Claude/Codex/Gemini | 各自 worktree 独立开发 | Agent 自动 |
-| 质量门禁 | vk-hooks.sh | lint + 测试 → 状态 In review | **全自动** |
-| 交叉审查 | **Dispatcher** | 检测 In review → 创建审查 Session | **全自动** |
+| 质量门禁 | vk-hooks.sh | lint + 测试 → push 分支 → 状态 In review | **全自动** |
+| 创建 PR | **Dispatcher** | 检测 In review → GitHub 创建 PR (含 diff 统计) | **全自动** |
+| 交叉审查 | **Dispatcher** | PR 创建后 → 创建审查 Session (注入 PR diff) | **全自动** |
 | 审查执行 | 交叉 Agent | 审查 PR diff → 通过/驳回 | Agent 自动 |
-| 合并上线 | **Dispatcher** | 检测 Done → merge → main | **全自动** |
+| 合并上线 | **Dispatcher** | 检测 Done → GitHub Merge PR (squash) | **全自动** |
 
 ## 配置说明
 
@@ -389,8 +391,9 @@ Issue 在 VK 看板上的流转:
       │              ▲                   │ ▲               │
       │              │                   │ │               │
  Dispatcher    编码 Agent 的          Dispatcher      Dispatcher
- 创建编码      cleanup 自动设置       创建审查        合并到 main
- Session                             Session
+ 创建编码      cleanup: push 分支     ① 创建 PR      GitHub API
+ Session       + 自动设置状态         ② 创建审查      Merge PR
+                                     Session(含diff)
 ```
 
 ### 信号机制
@@ -398,8 +401,8 @@ Issue 在 VK 看板上的流转:
 | 生命周期阶段 | 信号来源 | 信号内容 | Dispatcher 动作 |
 |------------|---------|---------|----------------|
 | Issue → To do | 用户/Copilot | VK Issue 状态 | 创建编码 Session (可选) |
-| 编码完成 | cleanup (vk-hooks.sh) | 状态 → In review | 创建交叉审查 Session |
-| 审查完成 | cleanup (vk-hooks.sh) | 状态 → Done | 合并编码分支到 main |
+| 编码完成 | cleanup (vk-hooks.sh) | push 分支 + 状态 → In review | ① 创建 PR ② 创建审查 Session(注入 diff) |
+| 审查完成 | cleanup (vk-hooks.sh) | 状态 → Done | GitHub Merge PR (squash) |
 | 审查驳回 | cleanup (vk-hooks.sh) | 状态 → In progress | 无（等待修复后重跑） |
 
 ### 配置
@@ -417,6 +420,9 @@ Issue 在 VK 看板上的流转:
     "auto_start_coding": false,
     "auto_start_review": true,
     "auto_merge": true,
+    "auto_create_pr": true,
+    "pr_merge_method": "squash",
+    "pr_draft": false,
     "default_coder_executor": "CLAUDE_CODE",
     "cross_review_map": {
         "CLAUDE_CODE": "CODEX",
@@ -426,6 +432,27 @@ Issue 在 VK 看板上的流转:
 ```
 
 > `auto_start_coding` 默认关闭——Issue 描述质量直接影响编码质量，建议人工审核后再启动。
+
+#### PR 配置说明
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `auto_create_pr` | `true` | 是否在 In review 时自动创建 GitHub PR |
+| `pr_merge_method` | `"squash"` | PR 合并方式: `squash` / `merge` / `rebase` |
+| `pr_draft` | `false` | 是否创建 Draft PR |
+| `pr_body_template` | 内置模板 | PR body 模板，支持 `{simple_id}` `{title}` `{diff_stat}` 占位符 |
+
+#### GitHub Token
+
+PR 创建和合并需要 GitHub Token (repo 权限):
+
+```bash
+# 方式 1: 环境变量（推荐）
+export GITHUB_TOKEN=ghp_xxxx
+
+# 方式 2: 项目文件（自动被 .gitignore 排除）
+echo "ghp_xxxx" > .vk/github_token
+```
 
 ### 使用
 

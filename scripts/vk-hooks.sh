@@ -145,8 +145,8 @@ _vk_update_issue_status() {
 
 # 质量门禁通过后调用
 # 根据阶段自动设置目标状态:
-#   coding → "In review"（dispatcher 会自动创建审查 Session）
-#   review → "Done"（dispatcher 会自动合并到主分支）
+#   coding → push 分支到远端 → "In review"（dispatcher 会自动创建 PR + 审查 Session）
+#   review → "Done"（dispatcher 会自动通过 GitHub API 合并 PR）
 vk_on_cleanup_success() {
     local issue_id
     if ! issue_id=$(_vk_get_issue_id); then
@@ -164,6 +164,9 @@ vk_on_cleanup_success() {
             _vk_update_issue_status "$issue_id" "Done" || true
             ;;
         coding|*)
+            # 编码完成: 先推送分支到 GitHub，再更新状态
+            # Dispatcher 检测到 In review 后会自动创建 PR + 启动审查 Session
+            _vk_push_branch || true
             _vk_update_issue_status "$issue_id" "In review" || true
             ;;
     esac
@@ -183,4 +186,30 @@ vk_on_cleanup_failure() {
     echo -e "\n  \033[0;34m▸ VK 工作流钩子: cleanup 失败 (阶段: ${phase})\033[0m"
     # 失败时保持当前状态，不做额外操作
     echo -e "  Issue 保持当前状态"
+}
+
+# 推送当前分支到 GitHub remote
+# 编码完成后推送，为后续 Dispatcher 创建 PR 做准备
+_vk_push_branch() {
+    local branch
+    branch=$(git -C "${_VK_PROJECT_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    if [ -z "$branch" ]; then
+        echo -e "  \033[1;33m⚠\033[0m 无法获取当前分支，跳过 push"
+        return 1
+    fi
+
+    # 检查是否有 remote
+    if ! git -C "${_VK_PROJECT_ROOT}" remote get-url origin &>/dev/null; then
+        echo -e "  \033[1;33m⚠\033[0m 无 origin remote，跳过 push（本地模式）"
+        return 0
+    fi
+
+    echo -e "  \033[0;34m▸ 推送分支 ${branch} → origin\033[0m"
+    if git -C "${_VK_PROJECT_ROOT}" push origin "${branch}" 2>/dev/null; then
+        echo -e "  \033[0;32m✓\033[0m 分支已推送"
+        return 0
+    else
+        echo -e "  \033[1;33m⚠\033[0m push 失败（可能无网络或认证问题），Dispatcher 会重试"
+        return 1
+    fi
 }

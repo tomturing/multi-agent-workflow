@@ -11,6 +11,11 @@
     "auto_start_coding": false,
     "auto_start_review": true,
     "auto_merge": true,
+    "auto_create_pr": true,
+
+    "pr_merge_method": "squash",
+    "pr_draft": false,
+    "pr_body_template": "## {simple_id}: {title}\n\n### 变更统计\n{diff_stat}\n\n_由 Dispatcher 自动创建_",
 
     "default_coder_executor": "CLAUDE_CODE",
     "cross_review_map": {

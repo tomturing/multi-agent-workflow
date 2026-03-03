@@ -27,6 +27,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 
+from .github import GitHubAPIError, GitHubClient
 from .vk import VKMCPClient, VKRestClient
 
 logger = logging.getLogger("dispatcher")
@@ -53,8 +54,18 @@ class DispatcherConfig:
 
     # ---- 可选: 自动化开关 ----
     auto_start_coding: bool = False   # To do → 自动启动编码（默认关闭，需人工审核任务描述）
+    auto_create_pr: bool = True       # 编码完成 → 自动创建 PR 并推送到 GitHub
     auto_start_review: bool = True    # In review → 自动启动审查
-    auto_merge: bool = True           # Done → 自动合并到主分支
+    auto_merge: bool = True           # Done → 自动通过 GitHub API 合并 PR
+
+    # ---- 可选: PR 配置 ----
+    pr_merge_method: str = "squash"   # 合并方式: squash / merge / rebase
+    pr_draft: bool = False            # 是否创建为 Draft PR
+    pr_body_template: str = (
+        "## {simple_id}: {title}\n\n"
+        "### 变更概述\n\n{diff_stat}\n\n"
+        "### 关联 Issue\n\nResolves VK Issue `{simple_id}`\n"
+    )
 
     # ---- 可选: Agent 配置 ----
     default_coder_executor: str = "CLAUDE_CODE"
@@ -96,8 +107,12 @@ class DispatcherConfig:
             poll_interval=int(data.get("poll_interval", 30)),
             vk_port=vk_port,
             auto_start_coding=data.get("auto_start_coding", False),
+            auto_create_pr=data.get("auto_create_pr", True),
             auto_start_review=data.get("auto_start_review", True),
             auto_merge=data.get("auto_merge", True),
+            pr_merge_method=data.get("pr_merge_method", "squash"),
+            pr_draft=data.get("pr_draft", False),
+            pr_body_template=data.get("pr_body_template", cls.pr_body_template),
             default_coder_executor=data.get("default_coder_executor", "CLAUDE_CODE"),
             cross_review_map=data.get("cross_review_map", {
                 "CLAUDE_CODE": "CODEX",
@@ -124,6 +139,10 @@ class IssueTracker:
     coding_workspace_id: str | None = None
     coding_branch: str | None = None
     coder_executor: str | None = None
+    # PR
+    pr_number: int | None = None
+    pr_url: str | None = None
+    pr_merged: bool = False
     # 审查阶段
     review_workspace_id: str | None = None
     review_branch: str | None = None
@@ -142,9 +161,9 @@ class Dispatcher:
 
     状态机:
         To do       ──[auto_start_coding]──►  创建编码 Session → In progress
-        In progress ──[等待 Agent 完成]──►    (cleanup 自动设 In review)
-        In review   ──[auto_start_review]──►  创建审查 Session
-        Done        ──[auto_merge]──────────► 合并分支 → 完成
+        In progress ──[等待 Agent 完成]──►    (cleanup: push + 状态 In review)
+        In review   ──[auto_create_pr]─────►  创建 PR → 创建审查 Session
+        Done        ──[auto_merge]──────────► GitHub merge PR → 完成
     """
 
     def __init__(self, config: DispatcherConfig, *, dry_run: bool = False):
@@ -274,13 +293,17 @@ class Dispatcher:
             logger.info("[%s] ▸ %s: 自动创建编码 Session", trace_id, sid)
             self._action_start_coding(issue_id, issue, trace_id)
 
-        elif new_status == "In review" and self.config.auto_start_review:
-            logger.info("[%s] ▸ %s: 自动创建审查 Session", trace_id, sid)
-            self._action_start_review(issue_id, issue, trace_id)
+        elif new_status == "In review":
+            # In review: 先创建 PR（如果还没有），再启动审查 Session
+            if self.config.auto_create_pr:
+                self._action_create_pr(issue_id, issue, trace_id)
+            if self.config.auto_start_review:
+                logger.info("[%s] ▸ %s: 自动创建审查 Session", trace_id, sid)
+                self._action_start_review(issue_id, issue, trace_id)
 
         elif new_status == "Done" and self.config.auto_merge:
-            logger.info("[%s] ▸ %s: 自动合并到 %s", trace_id, sid, self.config.main_branch)
-            self._action_merge(issue_id, trace_id)
+            logger.info("[%s] ▸ %s: 自动合并 PR", trace_id, sid)
+            self._action_merge_pr(issue_id, trace_id)
 
     def _check_pending(self, issue_id: str, issue: dict, trace_id: str):
         """检查当前状态是否有未完成的补偿动作
@@ -288,6 +311,16 @@ class Dispatcher:
         场景: 调度器在动作执行中途崩溃重启，或启动时 Issue 已在某状态
         """
         t = self._trackers[issue_id]
+
+        # In review 但无 PR → 补偿创建 PR
+        if (
+            t.status == "In review"
+            and self.config.auto_create_pr
+            and not t.pr_number
+            and t.coding_branch
+        ):
+            logger.info("[%s] ▸ %s: 补偿 — In review 但无 PR", trace_id, t.simple_id)
+            self._action_create_pr(issue_id, issue, trace_id)
 
         # In review 但无审查 Session → 补偿创建
         if (
@@ -298,15 +331,15 @@ class Dispatcher:
             logger.info("[%s] ▸ %s: 补偿 — In review 但无审查 Session", trace_id, t.simple_id)
             self._action_start_review(issue_id, issue, trace_id)
 
-        # Done 但未合并 → 补偿合并
+        # Done 但 PR 未合并 → 补偿合并
         if (
             t.status == "Done"
             and self.config.auto_merge
-            and not t.merged
-            and t.coding_branch
+            and not t.pr_merged
+            and t.pr_number
         ):
-            logger.info("[%s] ▸ %s: 补偿 — Done 但未合并", trace_id, t.simple_id)
-            self._action_merge(issue_id, trace_id)
+            logger.info("[%s] ▸ %s: 补偿 — Done 但 PR 未合并", trace_id, t.simple_id)
+            self._action_merge_pr(issue_id, trace_id)
 
     # ---- 编排动作 ----
 
@@ -364,7 +397,7 @@ class Dispatcher:
             mcp.close()
 
     def _action_start_review(self, issue_id: str, issue: dict, trace_id: str):
-        """动作: 创建交叉审查 Session"""
+        """动作: 创建交叉审查 Session，prompt 中注入 PR URL 和 diff 范围"""
         if self.dry_run:
             logger.info("[%s] [DRY-RUN] 跳过创建审查 Session", trace_id)
             return
@@ -387,7 +420,9 @@ class Dispatcher:
             t.coding_branch = base_branch
 
         title = f"Review: {base_branch} ({reviewer})"
-        prompt = self._load_prompt(self.config.review_prompt_file)
+
+        # 构建增强 prompt: 基础 prompt + PR 信息 + diff 范围
+        prompt = self._build_review_prompt(t, trace_id)
 
         mcp = VKMCPClient(port=self.config.vk_port)
         if not mcp.connect():
@@ -417,18 +452,179 @@ class Dispatcher:
             self._save_state()
 
             logger.info(
-                "[%s] ✓ 审查 Session: ws=%s executor=%s base=%s",
+                "[%s] ✓ 审查 Session: ws=%s executor=%s base=%s pr=#%s",
                 trace_id, ws_id[:8], reviewer, base_branch,
+                t.pr_number or "N/A",
             )
         finally:
             mcp.close()
 
-    def _action_merge(self, issue_id: str, trace_id: str):
-        """动作: 合并编码分支到主分支"""
+    def _action_create_pr(self, issue_id: str, issue: dict, trace_id: str):
+        """动作: 在 GitHub 上创建 Pull Request
+
+        在 In review 状态下触发，PR 是审查的容器。
+        创建前先确保分支已推送到远端。
+        """
         if self.dry_run:
-            logger.info("[%s] [DRY-RUN] 跳过合并", trace_id)
+            logger.info("[%s] [DRY-RUN] 跳过创建 PR", trace_id)
             return
 
+        t = self._trackers[issue_id]
+
+        # 跳过已有 PR 的情况
+        if t.pr_number:
+            logger.info("[%s] PR 已存在: #%d", trace_id, t.pr_number)
+            return
+
+        # 需要编码分支
+        branch = t.coding_branch
+        if not branch:
+            branch = self._discover_coding_branch(issue_id, issue, trace_id)
+            if not branch:
+                self._error_count += 1
+                logger.error("[%s] 无编码分支信息，无法创建 PR", trace_id)
+                return
+            t.coding_branch = branch
+
+        try:
+            gh = GitHubClient.from_project(self.config.project_dir)
+        except GitHubAPIError as e:
+            self._error_count += 1
+            logger.error("[%s] GitHub 客户端初始化失败: %s", trace_id, e)
+            return
+
+        # 确保分支已推送（cleanup 可能已 push，这里是补偿）
+        GitHubClient.push_branch(self.config.project_dir, branch)
+
+        # 检查是否已有 open PR（幂等）
+        try:
+            existing = gh.list_open_prs(head=branch)
+            if existing:
+                pr = existing[0]
+                t.pr_number = pr["number"]
+                t.pr_url = pr["html_url"]
+                self._save_state()
+                logger.info("[%s] 发现已有 PR: #%d %s", trace_id, pr["number"], pr["html_url"])
+                return
+        except GitHubAPIError:
+            pass  # 列表失败不阻塞，继续创建
+
+        # 生成 diff 统计（用于 PR body）
+        diff_stat = GitHubClient.generate_diff(
+            self.config.project_dir,
+            self.config.main_branch,
+            branch,
+            stat_only=True,
+        )
+
+        # 构建 PR body
+        pr_title = f"{t.simple_id}: {t.title}" if t.simple_id else t.title
+        pr_body = self.config.pr_body_template.format(
+            simple_id=t.simple_id or "N/A",
+            title=t.title,
+            diff_stat=f"```\n{diff_stat}\n```" if diff_stat else "_无变更统计_",
+        )
+
+        try:
+            pr = gh.create_pr(
+                head=branch,
+                base=self.config.main_branch,
+                title=pr_title,
+                body=pr_body,
+                draft=self.config.pr_draft,
+            )
+
+            t.pr_number = pr["number"]
+            t.pr_url = pr["html_url"]
+            self._action_count += 1
+            self._save_state()
+
+            logger.info(
+                "[%s] ✓ PR 已创建: #%d %s",
+                trace_id, pr["number"], pr["html_url"],
+            )
+        except GitHubAPIError as e:
+            self._error_count += 1
+            # 422 通常是已有相同 head/base 的 PR
+            if e.status == 422:
+                logger.warning("[%s] PR 创建冲突 (422)，可能已存在", trace_id)
+            else:
+                logger.error("[%s] PR 创建失败: %s", trace_id, e)
+
+    def _action_merge_pr(self, issue_id: str, trace_id: str):
+        """动作: 通过 GitHub API 合并 Pull Request
+
+        业界最佳实践: 通过 merge PR API（而非 git merge）确保:
+        - 审计链完整（谁批准、谁合并）
+        - 支持 squash merge（干净的主分支历史）
+        - 尊重分支保护规则
+        """
+        if self.dry_run:
+            logger.info("[%s] [DRY-RUN] 跳过合并 PR", trace_id)
+            return
+
+        t = self._trackers[issue_id]
+
+        if not t.pr_number:
+            # 没有 PR → 回退到本地 git merge（兼容无 GitHub 场景）
+            logger.warning("[%s] 无 PR 编号，回退到本地 git merge", trace_id)
+            self._action_merge_local(issue_id, trace_id)
+            return
+
+        try:
+            gh = GitHubClient.from_project(self.config.project_dir)
+        except GitHubAPIError as e:
+            self._error_count += 1
+            logger.error("[%s] GitHub 客户端初始化失败: %s", trace_id, e)
+            return
+
+        merge_title = f"{t.simple_id}: {t.title}" if t.simple_id else t.title
+
+        try:
+            result = gh.merge_pr(
+                t.pr_number,
+                merge_method=self.config.pr_merge_method,
+                commit_title=merge_title,
+            )
+
+            if result.get("merged"):
+                t.pr_merged = True
+                t.merged = True
+                self._action_count += 1
+                self._save_state()
+
+                logger.info(
+                    "[%s] ✓ PR #%d 已合并 (%s) → %s  sha=%s",
+                    trace_id, t.pr_number, self.config.pr_merge_method,
+                    self.config.main_branch, result.get("sha", "?")[:8],
+                )
+
+                # 合并后拉取最新主分支到本地
+                self._pull_main(trace_id)
+            else:
+                self._error_count += 1
+                logger.error(
+                    "[%s] PR #%d 合并失败: %s",
+                    trace_id, t.pr_number, result.get("message", "unknown"),
+                )
+
+        except GitHubAPIError as e:
+            self._error_count += 1
+            if e.status == 405:
+                logger.error(
+                    "[%s] PR #%d 不可合并 (405) — 可能有冲突或未通过 CI",
+                    trace_id, t.pr_number,
+                )
+            elif e.status == 409:
+                logger.error(
+                    "[%s] PR #%d HEAD 已移动 (409) — 需要更新分支",
+                    trace_id, t.pr_number,
+                )
+            else:
+                logger.error("[%s] PR #%d 合并失败: %s", trace_id, t.pr_number, e)
+
+    def _action_merge_local(self, issue_id: str, trace_id: str):
+        """回退动作: 本地 git merge（无 GitHub 时使用）"""
         t = self._trackers[issue_id]
         branch = t.coding_branch
 
@@ -441,20 +637,17 @@ class Dispatcher:
         merge_msg = f"merge: {t.simple_id} {t.title}"
 
         try:
-            # 保存当前分支
             result = subprocess.run(
                 [*git, "rev-parse", "--abbrev-ref", "HEAD"],
                 capture_output=True, text=True, check=True,
             )
             original = result.stdout.strip()
 
-            # 切换到主分支
             subprocess.run(
                 [*git, "checkout", self.config.main_branch],
                 check=True, capture_output=True, text=True,
             )
 
-            # 合并（--no-ff 保留历史）
             subprocess.run(
                 [*git, "merge", "--no-ff", branch, "-m", merge_msg],
                 check=True, capture_output=True, text=True,
@@ -464,23 +657,74 @@ class Dispatcher:
             self._action_count += 1
             self._save_state()
 
-            logger.info(
-                "[%s] ✓ 已合并 %s → %s",
-                trace_id, branch, self.config.main_branch,
-            )
+            logger.info("[%s] ✓ 本地合并 %s → %s", trace_id, branch, self.config.main_branch)
 
-            # 恢复原分支
             if original != self.config.main_branch:
-                subprocess.run(
-                    [*git, "checkout", original],
-                    capture_output=True, text=True,
-                )
+                subprocess.run([*git, "checkout", original], capture_output=True, text=True)
+
         except subprocess.CalledProcessError as e:
             self._error_count += 1
             stderr = e.stderr if isinstance(e.stderr, str) else ""
-            logger.error("[%s] 合并失败: %s", trace_id, stderr.strip() or str(e))
+            logger.error("[%s] 本地合并失败: %s", trace_id, stderr.strip() or str(e))
 
     # ---- 辅助方法 ----
+
+    def _build_review_prompt(self, tracker: IssueTracker, trace_id: str) -> str | None:
+        """构建增强审查 prompt: 基础 prompt + PR 信息 + diff 范围
+
+        审查 Agent 需要知道:
+        1. PR URL（直接查看）
+        2. diff 范围（应该审查哪些文件）
+        3. 变更统计（影响范围）
+        """
+        # 加载基础 prompt
+        base_prompt = self._load_prompt(self.config.review_prompt_file) or ""
+
+        # PR 信息
+        pr_section = ""
+        if tracker.pr_url:
+            pr_section = f"\n## Pull Request\n\nPR: {tracker.pr_url}\n"
+
+        # diff 范围
+        diff_section = ""
+        if tracker.coding_branch:
+            diff_stat = GitHubClient.generate_diff(
+                self.config.project_dir,
+                self.config.main_branch,
+                tracker.coding_branch,
+                stat_only=True,
+            )
+            if diff_stat:
+                diff_section = (
+                    f"\n## 变更范围\n\n"
+                    f"分支: `{tracker.coding_branch}` → `{self.config.main_branch}`\n\n"
+                    f"```\n{diff_stat}\n```\n\n"
+                    f"审查命令: `git diff {self.config.main_branch}...{tracker.coding_branch}`\n"
+                )
+
+        if not pr_section and not diff_section:
+            return base_prompt if base_prompt else None
+
+        enhanced = base_prompt + pr_section + diff_section
+        return enhanced[:3000]  # 限制总长度
+
+    def _pull_main(self, trace_id: str):
+        """合并后拉取最新主分支到本地"""
+        git = ["git", "-C", self.config.project_dir]
+        try:
+            subprocess.run(
+                [*git, "fetch", "origin", self.config.main_branch],
+                capture_output=True, text=True, check=True,
+            )
+            # 尝试 fast-forward 更新本地主分支
+            subprocess.run(
+                [*git, "branch", "-f", self.config.main_branch,
+                 f"origin/{self.config.main_branch}"],
+                capture_output=True, text=True,
+            )
+            logger.info("[%s] 已同步本地 %s", trace_id, self.config.main_branch)
+        except subprocess.CalledProcessError as e:
+            logger.warning("[%s] 同步主分支失败: %s", trace_id, e)
 
     def _load_prompt(self, prompt_file: str) -> str | None:
         """加载提示词文件内容"""
