@@ -250,7 +250,21 @@ main() {
     safe_copy "${SCRIPTS_DIR}/agent-quality-gate.sh" "scripts/agent-quality-gate.sh"
     safe_copy "${SCRIPTS_DIR}/check-worktree-conflicts.sh" "scripts/check-worktree-conflicts.sh"
     safe_copy "${SCRIPTS_DIR}/post-merge-verify.sh" "scripts/post-merge-verify.sh"
+    safe_copy "${SCRIPTS_DIR}/vk-hooks.sh" "scripts/vk-hooks.sh"
     chmod +x scripts/agent-quality-gate.sh scripts/check-worktree-conflicts.sh scripts/post-merge-verify.sh 2>/dev/null || true
+
+    # dispatcher/ — 中央调度器（Python 模块）
+    local DISPATCHER_SRC="${SCRIPT_DIR}/dispatcher"
+    if [ -d "$DISPATCHER_SRC" ]; then
+        mkdir -p dispatcher
+        for py_file in "$DISPATCHER_SRC"/*.py; do
+            [ -f "$py_file" ] && safe_copy "$py_file" "dispatcher/$(basename "$py_file")"
+        done
+        log_ok "复制 dispatcher/ 模块"
+    fi
+
+    # .vk/dispatcher.json 配置模板
+    safe_copy "${TEMPLATE_DIR}/vk/dispatcher.json" ".vk/dispatcher.json"
 
     # ---- Step 4: 生成 CLAUDE.md ----
     log_header "Step 4: 生成 CLAUDE.md"
@@ -374,16 +388,20 @@ LOCALEOF
     echo "    CLAUDE.local.md        — 个人本地配置（不提交 git）"
     echo "    .vk/workflow.md        — 通用工作流规范"
     echo "    .vk/prompts/           — Agent 提示词模板"
+    echo "    .vk/dispatcher.json    — 中央调度器配置（填写 project/repo ID）"
     echo "    .vscode/mcp.json       — VS Code MCP Server 配置（VK 连接）"
-    echo "    scripts/agent-*.sh     — 自动化脚本"
+    echo "    scripts/               — 自动化脚本（质量门禁、VK 钩子等）"
+    echo "    dispatcher/            — 中央调度器模块（自动化编排引擎）"
     echo ""
     echo -e "  ${BOLD}下一步:${NC}"
     echo "    1. 检查 CLAUDE.md，完善所有 TODO 标注的项目定制内容"
     echo "    2. 按需修改 scripts/agent-quality-gate.sh 中的 lint/test 命令"
     echo "    3. 启动 Vibe Kanban: make vk (或 npx vibe-kanban)"
     echo "    4. 在 VS Code 中 Reload Window 以激活 MCP Server"
-    echo "    5. 在 VK Settings 中配置 Agent Profiles 和 Repository Scripts"
-    echo "    6. 提交到 git: git add . && git commit -m '初始化多 Agent 工作流'"
+    echo "    5. 填写 .vk/dispatcher.json 中的 organization_id / project_id / repo_id"
+    echo "    6. 填写 .vk/status_map.json（从 VK MCP list_issue_priorities 获取）"
+    echo "    7. 启动调度器: make dispatcher (或 python -m dispatcher)"
+    echo "    8. 提交到 git: git add . && git commit -m '初始化多 Agent 工作流'"
     echo ""
 }
 

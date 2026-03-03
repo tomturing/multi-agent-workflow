@@ -11,6 +11,17 @@
 #     1. .vk/issue_id 文件（编排者在 start_workspace_session 时写入）
 #     2. 环境变量 VK_ISSUE_ID
 #   - VK 地址来源: 环境变量 VK_API_URL 或默认 http://127.0.0.1:9527
+#   - 阶段检测:
+#     1. .vk/phase 文件（dispatcher 写入 "coding" 或 "review"）
+#     2. 分支名约定: 含 "review" 则为审查阶段，否则为编码阶段
+#
+# 状态转换:
+#   编码阶段（coding）:
+#     成功 → "In review"   — dispatcher 检测到后自动创建审查 Session
+#     失败 → 保持 "In progress"
+#   审查阶段（review）:
+#     成功 → "Done"        — dispatcher 检测到后自动合并到主分支
+#     失败 → 保持 "In review"
 #
 # 前置条件:
 #   - .vk/status_map.json — 状态名→status_id 映射（编排者初始化项目时创建）
@@ -47,6 +58,25 @@ _vk_get_issue_id() {
     fi
 
     return 1
+}
+
+# 检测当前阶段: coding（编码）或 review（审查）
+_vk_detect_phase() {
+    # 优先级 1: 显式 .vk/phase 文件（dispatcher 创建 Session 时写入）
+    local phase_file="${_VK_PROJECT_ROOT}/.vk/phase"
+    if [ -f "$phase_file" ]; then
+        cat "$phase_file" | tr -d '[:space:]'
+        return 0
+    fi
+
+    # 优先级 2: 分支名约定（VK 审查分支包含 "review"）
+    local branch
+    branch=$(git -C "${_VK_PROJECT_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    if [[ "$branch" == *review* ]]; then
+        echo "review"
+    else
+        echo "coding"
+    fi
 }
 
 # 从 .vk/status_map.json 解析状态名到 status_id
@@ -113,7 +143,10 @@ _vk_update_issue_status() {
 
 # ---- 公开钩子函数 ----
 
-# 质量门禁通过后调用 — 将 Issue 状态更新为 "In review"
+# 质量门禁通过后调用
+# 根据阶段自动设置目标状态:
+#   coding → "In review"（dispatcher 会自动创建审查 Session）
+#   review → "Done"（dispatcher 会自动合并到主分支）
 vk_on_cleanup_success() {
     local issue_id
     if ! issue_id=$(_vk_get_issue_id); then
@@ -121,18 +154,33 @@ vk_on_cleanup_success() {
         return 0  # 非致命错误，不影响 cleanup 退出码
     fi
 
-    echo -e "\n  \033[0;34m▸ VK 工作流钩子: cleanup 成功\033[0m"
-    _vk_update_issue_status "$issue_id" "In review" || true
+    local phase
+    phase=$(_vk_detect_phase)
+
+    echo -e "\n  \033[0;34m▸ VK 工作流钩子: cleanup 成功 (阶段: ${phase})\033[0m"
+
+    case "$phase" in
+        review)
+            _vk_update_issue_status "$issue_id" "Done" || true
+            ;;
+        coding|*)
+            _vk_update_issue_status "$issue_id" "In review" || true
+            ;;
+    esac
 }
 
-# 质量门禁失败后调用（可选：保持 In progress 或标记为 blocked）
+# 质量门禁失败后调用
+# 保持当前状态（不回退），等待人工或 Agent 修复后重跑
 vk_on_cleanup_failure() {
     local issue_id
     if ! issue_id=$(_vk_get_issue_id); then
         return 0
     fi
 
-    echo -e "\n  \033[0;34m▸ VK 工作流钩子: cleanup 失败\033[0m"
-    # 失败时保持 In progress，不做额外操作
-    echo -e "  Issue 保持当前状态 (In progress)"
+    local phase
+    phase=$(_vk_detect_phase)
+
+    echo -e "\n  \033[0;34m▸ VK 工作流钩子: cleanup 失败 (阶段: ${phase})\033[0m"
+    # 失败时保持当前状态，不做额外操作
+    echo -e "  Issue 保持当前状态"
 }

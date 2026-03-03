@@ -1,0 +1,23 @@
+{
+    "_comment_": "VK 中央调度器配置 — 请填写 TODO 处。运行 list_organizations / list_projects / list_repos 获取 ID。",
+    "organization_id": "TODO: list_organizations 获取",
+    "project_id": "TODO: list_projects 获取",
+    "repo_id": "TODO: list_repos 获取",
+
+    "main_branch": "master",
+    "poll_interval": 30,
+    "vk_port": 9527,
+
+    "auto_start_coding": false,
+    "auto_start_review": true,
+    "auto_merge": true,
+
+    "default_coder_executor": "CLAUDE_CODE",
+    "cross_review_map": {
+        "CLAUDE_CODE": "CODEX",
+        "CODEX": "CLAUDE_CODE",
+        "GEMINI": "CODEX"
+    },
+    "coding_prompt_file": ".vk/prompts/coder.md",
+    "review_prompt_file": ".vk/prompts/reviewer.md"
+}

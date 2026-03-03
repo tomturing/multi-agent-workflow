@@ -23,12 +23,19 @@
 │         需求分析 → Mermaid 架构图 → 任务分解         │
 │           调用 VK MCP → 自动创建 Issue              │
 └────────────────┬───────────────────────────────────┘
-                 │ create_task / start_workspace_session
+                 │ create_task
                  ▼
 ┌────────────────────────────────────────────────────┐
-│               Vibe Kanban (调度中心)                │
-│   管理任务 │ 分配 Workspace │ 自动 Git Worktree      │
-│   Agent Profiles │ MCP Server                      │
+│               Vibe Kanban (任务/Workspace 管理)     │
+│   看板 │ Workspace │ Git Worktree │ MCP Server      │
+└───────┬────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────┐
+│           Dispatcher (中央调度守护进程)              │
+│  轮询 VK REST API → 检测状态变化 → 触发编排动作      │
+│  To do → 编码Session │ In review → 审查Session      │
+│  Done → 合并主分支   │ 交叉审查矩阵                  │
 └───────┬────────────┬────────────┬──────────────────┘
         ▼            ▼            ▼
    ┌──────────┐  ┌──────────┐  ┌──────────┐
@@ -38,9 +45,11 @@
    │ 编码/审查 │  │ 编码/审查│  │ 编码/审查 │
    │ worktree │  │ worktree │  │ worktree │
    └────┬─────┘  └────┬─────┘  └────┬─────┘
-        └─────────────┼─────────────┘
-                      ▼
-            质量门禁 → PR → 合并 main
+        │              │              │
+        └── cleanup 钩子 → 质量门禁 → 状态更新 ──┐
+                                                │
+            Dispatcher 检测状态变化 ←────────────┘
+              → 创建交叉审查 / 合并 / Done
 ```
 
 ## 快速开始
@@ -92,12 +101,18 @@ git add . && git commit -m "初始化多 Agent 工作流"
 multi-agent-workflow/
 ├── README.md                       # 本文件
 ├── init.sh                         # 初始化入口脚本
+├── dispatcher/                     # 中央调度器（Python 模块）
+│   ├── __init__.py
+│   ├── __main__.py                 # CLI: python -m dispatcher
+│   ├── core.py                     # 轮询引擎 + 状态机 + 编排动作
+│   └── vk.py                       # VK REST API + MCP stdio 客户端
 ├── templates/
 │   ├── CLAUDE.md.tmpl              # 项目 CLAUDE.md 模板（含占位符变量）
 │   ├── gitignore.append            # .gitignore 追加内容
 │   ├── Makefile.append             # Makefile 追加内容
 │   └── vk/
 │       ├── workflow.md             # 通用工作流规范（§1-§9）
+│       ├── dispatcher.json         # 调度器配置模板
 │       ├── prompts/
 │       │   ├── coder.md            # Coder Agent 提示词
 │       │   ├── reviewer.md         # Reviewer Agent 提示词
@@ -106,6 +121,7 @@ multi-agent-workflow/
 │           └── .gitignore
 └── scripts/
     ├── agent-quality-gate.sh       # 质量门禁脚本
+    ├── vk-hooks.sh                 # VK 状态流转钩子（阶段感知）
     ├── check-worktree-conflicts.sh # Worktree 冲突检测脚本
     └── post-merge-verify.sh        # 合并后验证脚本
 ```
@@ -139,14 +155,16 @@ my-project/
 
 详见初始化后项目中的 `.vk/workflow.md`，核心流程：
 
-| 阶段 | 执行者 | 动作 |
-|------|--------|------|
-| 需求分析 | Copilot Plan Mode | 分析需求 → 画架构图 → 生成任务分解 |
-| 任务创建 | Copilot (VK MCP) | 调用 `create_task` 自动创建 Issues |
-| 并行编码 | Claude/Codex/Gemini | 各自 worktree 独立开发 |
-| 质量门禁 | agent-quality-gate.sh | lint + 单测 + 冲突检测 |
-| 代码审查 | 任意 Agent | 交叉审查，生成结构化报告 |
-| 合并上线 | 人工确认 | PR → main → post-merge-verify |
+| 阶段 | 执行者 | 动作 | 自动化 |
+|------|--------|------|--------|
+| 需求分析 | Copilot Plan Mode | 分析需求 → 架构图 → 任务分解 | 人工 |
+| 任务创建 | Copilot (VK MCP) | `create_task` → Issue To do | 人工/半自动 |
+| 编码启动 | **Dispatcher** | 检测 To do → 创建编码 Session | 可选自动 |
+| 并行编码 | Claude/Codex/Gemini | 各自 worktree 独立开发 | Agent 自动 |
+| 质量门禁 | vk-hooks.sh | lint + 测试 → 状态 In review | **全自动** |
+| 交叉审查 | **Dispatcher** | 检测 In review → 创建审查 Session | **全自动** |
+| 审查执行 | 交叉 Agent | 审查 PR diff → 通过/驳回 | Agent 自动 |
+| 合并上线 | **Dispatcher** | 检测 Done → merge → main | **全自动** |
 
 ## 配置说明
 
@@ -189,10 +207,13 @@ cc-switch gemini    # GOOGLE_API_KEY
 初始化后项目支持以下 Make 命令：
 
 ```bash
-make vk              # 启动 Vibe Kanban
-make quality-gate    # 运行质量门禁
-make conflict-check  # 检测 worktree 冲突
-make post-merge      # 合并后验证
+make vk                # 启动 Vibe Kanban
+make dispatcher        # 启动中央调度器（轮询模式，Ctrl+C 停止）
+make dispatcher-once   # 单次轮询（测试用）
+make dispatcher-status # 查看调度状态
+make quality-gate      # 运行质量门禁
+make conflict-check    # 检测 worktree 冲突
+make post-merge        # 合并后验证
 ```
 
 ## 自定义
@@ -349,6 +370,97 @@ prompt_override:  自定义 system prompt
 | 脚本执行到一半中断 | `set -e` 下某步返回非零 | 所有 `safe_copy` / `safe_append` 已确保返回 0 |
 | Makefile 重复追加 | 标记检测不够健壮 | `safe_append` 支持多标记检测（任一匹配即跳过） |
 | 符号链接 AGENTS.md 报错 | Windows 文件系统不支持符号链接 | 在 WSL 内运行，或手动复制代替 |
+
+## 中央调度器（Dispatcher）
+
+### 设计思路
+
+由于 Vibe Kanban 目前**不支持 Webhook**，无法在 Issue 状态变化时主动通知外部系统。
+Dispatcher 通过轮询 VK REST API 弥补这一缺口，实现全自动化流水线。
+
+**核心理念：cleanup 脚本只负责"发信号"（更新状态），Dispatcher 负责"收信号并编排"。**
+
+```
+Issue 在 VK 看板上的流转:
+
+ ┌────────┐     ┌────────────┐     ┌───────────┐     ┌──────┐
+ │ To do  │ ──► │In progress │ ──► │ In review │ ──► │ Done │
+ └────────┘     └────────────┘     └───────────┘     └──────┘
+      │              ▲                   │ ▲               │
+      │              │                   │ │               │
+ Dispatcher    编码 Agent 的          Dispatcher      Dispatcher
+ 创建编码      cleanup 自动设置       创建审查        合并到 main
+ Session                             Session
+```
+
+### 信号机制
+
+| 生命周期阶段 | 信号来源 | 信号内容 | Dispatcher 动作 |
+|------------|---------|---------|----------------|
+| Issue → To do | 用户/Copilot | VK Issue 状态 | 创建编码 Session (可选) |
+| 编码完成 | cleanup (vk-hooks.sh) | 状态 → In review | 创建交叉审查 Session |
+| 审查完成 | cleanup (vk-hooks.sh) | 状态 → Done | 合并编码分支到 main |
+| 审查驳回 | cleanup (vk-hooks.sh) | 状态 → In progress | 无（等待修复后重跑） |
+
+### 配置
+
+`.vk/dispatcher.json`:
+
+```json
+{
+    "organization_id": "xxx",
+    "project_id": "xxx",
+    "repo_id": "xxx",
+    "main_branch": "master",
+    "poll_interval": 30,
+    "vk_port": 9527,
+    "auto_start_coding": false,
+    "auto_start_review": true,
+    "auto_merge": true,
+    "default_coder_executor": "CLAUDE_CODE",
+    "cross_review_map": {
+        "CLAUDE_CODE": "CODEX",
+        "CODEX": "CLAUDE_CODE"
+    }
+}
+```
+
+> `auto_start_coding` 默认关闭——Issue 描述质量直接影响编码质量，建议人工审核后再启动。
+
+### 使用
+
+```bash
+# 启动守护进程（在另一个终端窗口运行）
+make dispatcher
+
+# 单次轮询（测试/调试用）
+make dispatcher-once
+
+# 查看调度状态
+make dispatcher-status
+
+# 高级用法
+python -m dispatcher -d /path/to/project run --dry-run  # 仅检测不执行
+python -m dispatcher -d /path/to/project -v run          # 调试日志
+```
+
+### 阶段感知机制
+
+`vk-hooks.sh` 通过两种方式判断当前 worktree 是编码阶段还是审查阶段：
+
+1. **`.vk/phase` 文件**（优先级高）— Dispatcher 创建 Session 时写入
+2. **分支名约定**（回退方案）— VK 审查分支名包含 `review`
+
+根据阶段:
+- 编码阶段 cleanup 成功 → 状态 "In review"
+- 审查阶段 cleanup 成功 → 状态 "Done"
+
+### 状态持久化
+
+Dispatcher 将追踪状态持久化到 `.vk/dispatcher_state.json`，支持:
+- 重启后恢复状态，避免重复触发
+- 补偿机制：首次启动时检测已有 Issue 的遗漏动作
+- 分支信息记录：自动关联 Issue → workspace → 分支名
 
 ## License
 
