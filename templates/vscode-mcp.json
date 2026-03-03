@@ -3,7 +3,10 @@
     "vibe_kanban": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "vibe-kanban@latest", "--mcp"]
+      "args": ["-y", "vibe-kanban@latest", "--mcp"],
+      "env": {
+        "PORT": "9527"
+      }
     }
   }
 }

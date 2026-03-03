@@ -160,7 +160,10 @@ my-project/
     "vibe_kanban": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "vibe-kanban@latest", "--mcp"]
+      "args": ["-y", "vibe-kanban@latest", "--mcp"],
+      "env": {
+        "PORT": "9527"
+      }
     }
   }
 }
@@ -168,6 +171,7 @@ my-project/
 
 > **⚠️ 注意**: VS Code MCP 配置使用 `"servers"` 键（非 `"mcpServers"`），且必须包含 `"type": "stdio"`。
 > `"mcpServers"` 是 Claude Desktop 的格式，VS Code 不识别。
+> `"env"` 中的 `PORT` 固定了 VK 端口，避免每次重启后端口变化导致需要 Reload Window。
 ```
 
 ### cc-switch
@@ -234,7 +238,10 @@ make post-merge      # 合并后验证
     "vibe_kanban": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "vibe-kanban@latest", "--mcp"]
+      "args": ["-y", "vibe-kanban@latest", "--mcp"],
+      "env": {
+        "PORT": "9527"
+      }
     }
   }
 }
