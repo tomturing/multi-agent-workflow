@@ -8,7 +8,7 @@
     "poll_interval": 30,
     "vk_port": 9527,
 
-    "auto_start_coding": false,
+    "auto_start_coding": true,
     "auto_start_review": true,
     "auto_merge": true,
     "auto_create_pr": true,

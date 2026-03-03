@@ -53,7 +53,7 @@ class DispatcherConfig:
     vk_port: int = 9527
 
     # ---- 可选: 自动化开关 ----
-    auto_start_coding: bool = False   # To do → 自动启动编码（默认关闭，需人工审核任务描述）
+    auto_start_coding: bool = True    # To do → 自动启动编码（Issue 由 Copilot Plan Mode 生成，描述质量有保证）
     auto_create_pr: bool = True       # 编码完成 → 自动创建 PR 并推送到 GitHub
     auto_start_review: bool = True    # In review → 自动启动审查
     auto_merge: bool = True           # Done → 自动通过 GitHub API 合并 PR
@@ -106,7 +106,7 @@ class DispatcherConfig:
             main_branch=data.get("main_branch", "master"),
             poll_interval=int(data.get("poll_interval", 30)),
             vk_port=vk_port,
-            auto_start_coding=data.get("auto_start_coding", False),
+            auto_start_coding=data.get("auto_start_coding", True),
             auto_create_pr=data.get("auto_create_pr", True),
             auto_start_review=data.get("auto_start_review", True),
             auto_merge=data.get("auto_merge", True),
@@ -352,7 +352,7 @@ class Dispatcher:
         t = self._trackers[issue_id]
         executor = self.config.default_coder_executor
         title = issue.get("title", t.simple_id)
-        prompt = self._load_prompt(self.config.coding_prompt_file)
+        prompt = self._build_coding_prompt(issue)
 
         mcp = VKMCPClient(port=self.config.vk_port)
         if not mcp.connect():
@@ -669,6 +669,50 @@ class Dispatcher:
 
     # ---- 辅助方法 ----
 
+    def _build_coding_prompt(self, issue: dict) -> str | None:
+        """构建编码 prompt: 工作流规范 + 项目规范 + Issue 完整上下文
+
+        注入顺序（从宏观到具体）:
+        1. coder.md     — 工作流规范和角色职责（通用）
+        2. CLAUDE.md    — 项目编码规范、技术栈、约束（项目级）
+        3. Issue 上下文 — simple_id / title / description（任务级）
+
+        Agent（Claude Code / Codex 等）收到后会:
+        - 根据 Issue 描述理解任务目标
+        - 根据 CLAUDE.md 约束遵守项目规范
+        - 自行读取代码库找到相关文件（无需 Dispatcher 推断）
+        """
+        parts: list[str] = []
+
+        # 1. 工作流规范（coder.md）
+        coder_prompt = self._load_prompt(self.config.coding_prompt_file)
+        if coder_prompt:
+            parts.append(coder_prompt)
+
+        # 2. 项目规范（CLAUDE.md）— 项目根目录下
+        claude_md = self._load_prompt("CLAUDE.md")
+        if claude_md:
+            parts.append(f"## 项目规范 (CLAUDE.md)\n\n{claude_md}")
+
+        # 3. Issue 完整上下文
+        simple_id = issue.get("simple_id", "")
+        title = issue.get("title", "")
+        description = issue.get("description") or issue.get("body", "")
+
+        issue_section = f"## 当前任务\n\n"
+        if simple_id:
+            issue_section += f"**{simple_id}**: "
+        issue_section += f"{title}\n"
+        if description:
+            issue_section += f"\n{description}\n"
+
+        parts.append(issue_section)
+
+        if not parts:
+            return None
+
+        return "\n\n---\n\n".join(parts)
+
     def _build_review_prompt(self, tracker: IssueTracker, trace_id: str) -> str | None:
         """构建增强审查 prompt: 基础 prompt + PR 信息 + diff 范围
 
@@ -727,11 +771,15 @@ class Dispatcher:
             logger.warning("[%s] 同步主分支失败: %s", trace_id, e)
 
     def _load_prompt(self, prompt_file: str) -> str | None:
-        """加载提示词文件内容"""
+        """加载提示词文件内容
+
+        上限 4000 字符：覆盖完整 coder.md / CLAUDE.md，
+        同时避免单个文件撑爆 Session 初始 context。
+        """
         path = os.path.join(self.config.project_dir, prompt_file)
         if os.path.isfile(path):
             with open(path) as f:
-                return f.read()[:2000]  # 限制长度防止占用过多 context
+                return f.read()[:4000]
         return None
 
     def _find_branch(self, mcp: VKMCPClient, workspace_id: str) -> str | None:
