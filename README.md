@@ -290,7 +290,59 @@ npx vibe-kanban  # 或 make vk
 - **多项目工作区**: 在 VS Code 打开的最外层目录创建 `.vscode/mcp.json`
 - `init.sh` 会同时在目标项目和工作区根目录都创建 mcp.json
 
-### 5. init.sh 常见问题
+### 5. VK Worktree 与 Master 不同步
+
+**症状**: Master 上修复了质量门禁脚本 bug，但 VK Worktree 中的 cleanup 仍然失败。
+
+**原因**: VK Worktree 在 `start_workspace_session` 时从当时的 master（或指定 base_branch）创建分支。如果 master 在 worktree 创建后有修复提交，worktree 不会自动同步。
+
+**解决方案**:
+```bash
+# 方案 1: 直接复制修复文件到 worktree（推荐，避免冲突）
+cp master/scripts/agent-quality-gate.sh worktree/scripts/
+cp master/pyproject.toml worktree/
+cd worktree && git add -A && git commit -m "fix: 同步 master 质量门禁修复"
+
+# 方案 2: rebase（⚠️ 如果 master 有大量格式化变更会产生大量冲突）
+cd worktree && git rebase master  # 不推荐：ruff format 等批量变更会导致大量冲突
+```
+
+### 6. Ruff 格式化引发 Rebase 冲突
+
+**症状**: `git rebase master` 产生大量冲突，每个 Python 文件都有 conflict marker。
+
+**原因**: Master 上运行了 `ruff format`（批量重新格式化几十个文件），Agent 分支修改了其中部分文件的逻辑。Git 无法区分"格式变更"和"逻辑变更"。
+
+**解决**: 不要 rebase。改用 cherry-pick 或直接复制需要同步的特定文件。大批量格式化应在 Agent 分支创建前完成。
+
+### 7. VK MCP `start_workspace_session` 参数名
+
+**症状**: 调用 `start_workspace_session` 时报 `missing field executor` 或 `missing field title`。
+
+**原因**: API 参数命名与直觉不同。
+
+**正确参数**:
+```
+title:            Session 名称（必填）
+executor:         运行时类型，可选值: CODEX / CLAUDE / GEMINI（不是 runtime）
+issue_id:         关联的 Issue ID
+repos:            [{"repo_id": "...", "base_branch": "..."}]
+prompt_override:  自定义 system prompt
+```
+
+### 8. 质量门禁前端检查误判
+
+**症状**: 前端 lint 报 `Command "lint" not found`，但脚本报为 FAIL 而不是 SKIP。
+
+**原因**: 两个问题叠加：
+1. `frontend/node_modules/` 存在（只有 `.pnpm-workspace-state` 文件），脚本判断为"已安装"
+2. `package.json` 没有定义 `lint` 脚本
+
+**修复**: 质量门禁脚本需要：
+- 检查 `frontend/node_modules/.pnpm/` 而非 `frontend/node_modules/`
+- 运行 lint 前检查 `grep -q '"lint"' package.json`
+
+### 9. init.sh 常见问题
 
 | 问题 | 原因 | 解决 |
 |------|------|------|
