@@ -165,6 +165,7 @@ class IssueTracker:
     # 时间戳
     updated_at: str = ""
     in_progress_since: str = ""  # 首次发现有提交时的时间戳（用于 QG 超时兜底计时）
+    last_qg_sha: str = ""        # 上一次通过 QG 并流转到 In review 的 SHA（防 ping-pong）
 
 
 # ============================================================================
@@ -343,6 +344,16 @@ class Dispatcher:
                 logger.info("[%s] ▸ %s: 自动创建审查 Session", trace_id, sid)
                 self._action_start_review(issue_id, issue, trace_id)
 
+        elif new_status == "In progress" and old_status == "In review":
+            # CHANGES_REQUESTED: 审查退回 → 清空审查 Session，重置编码轮次
+            logger.info("[%s] ▸ %s: CHANGES_REQUESTED → 重启编码轮次", trace_id, sid)
+            t = self._trackers[issue_id]
+            t.review_workspace_id = None
+            t.review_branch = None
+            t.coding_workspace_id = None  # 清空以创建新 workspace
+            t.in_progress_since = ""
+            self._action_start_coding(issue_id, issue, trace_id)
+
         elif new_status == "Done" and self.config.auto_merge:
             logger.info("[%s] ▸ %s: 自动合并 PR", trace_id, sid)
             self._action_merge_pr(issue_id, trace_id)
@@ -385,16 +396,16 @@ class Dispatcher:
             t.status == "In progress"
             and t.coding_workspace_id
             and t.coding_branch
-            and not t.pr_number
             and self._is_coding_done(t.coding_branch)
         ):
             sha = self._get_branch_head_sha(t.coding_branch)
-            if sha and self._is_qg_passed(sha):
+            if sha and self._is_qg_passed(sha) and sha != t.last_qg_sha:
                 # ① QG 标记存在（Agent 或 Dispatcher 兜底已通过）→ 直接流转
                 logger.info(
                     "[%s] ▸ %s: QG 标记存在 (%s)，移入 In review",
                     trace_id, t.simple_id, sha[:8],
                 )
+                t.last_qg_sha = sha  # 记录，防 CHANGES_REQUESTED 后 ping-pong
                 self._action_finish_coding(issue_id, issue, trace_id)
             elif not t.in_progress_since:
                 # ② 首次发现有提交，记录时间，等待 Agent 自行运行 QG

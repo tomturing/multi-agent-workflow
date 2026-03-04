@@ -82,6 +82,18 @@ class VKRestClient:
         matches = self.get_workspaces(title_filter=title)
         return matches[0] if matches else None
 
+    def get_workspace_by_id(self, ws_id: str) -> dict | None:
+        """\u6309 ID \u83b7\u53d6 workspace \u8be6\u60c5\uff08\u542b container_ref / agent_working_dir\uff09"""
+        try:
+            resp = urllib.request.urlopen(
+                f"{self.base_url}/api/task-attempts/{ws_id}", timeout=10
+            )
+            envelope: dict = json.loads(resp.read().decode())
+            return envelope.get("data") or envelope
+        except Exception as e:
+            logger.warning("get_workspace_by_id(%s) failed: %s", ws_id, e)
+            return None
+
     def archive_workspace(self, workspace_id: str) -> bool:
         """将 workspace 标记为已归档"""
         payload = json.dumps({"archived": True}).encode()
