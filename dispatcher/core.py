@@ -907,8 +907,10 @@ class Dispatcher:
             "该脚本将自动完成：\n"
             "1. 代码 lint 和格式化检查（ruff / eslint）\n"
             "2. 单元测试\n"
-            "3. 通过后调用 `vk-hooks.sh` 推送分支 + 更新 Issue 状态（In review）\n\n"
-            "**不要跳过此步骤** —— 这是工作流状态机的触发器，跳过会导致 Issue 卡在 \"In progress\"。"
+            "3. 通过后推送分支到远端\n\n"
+            "**不要跳过此步骤** —— VK 会在 Agent 退出后以 cleanup_script 再次运行验证，\n"
+            "Dispatcher 通过 SQLite 检测到验证通过后自动流转 Issue 状态。\n"
+            "提前运行可在 Agent 会话内发现并修复问题，避免因 cleanup_script 失败导致流程中断。"
         )
 
         if not parts:

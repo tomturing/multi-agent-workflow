@@ -165,13 +165,21 @@ class VKDatabase:
         """判断指定分支的质量门禁是否通过。
 
         检测逻辑（基于 VK container.rs 源码分析）：
-        1. 若仓库配置了 cleanup_script：
-           - cleanupscript 进程 status='completed' AND exit_code=0 → True（QG 通过）
-           - cleanupscript 进程 status='failed/killed' AND exit_code IS NOT NULL → False（真实失败）
-           - 无 cleanupscript 记录但 codingagent 已完成 → 检查 codingagent 状态（cleanup 可能还未启动）
+
+        VK 触发链：codingagent exit_code=0 → try_start_next_action → cleanupscript
+        cleanup_script 仅在 codingagent 正常退出（exit_code=0）时才会被 VK 自动触发。
+
+        1. 若仓库配置了 cleanup_script（authoritative QG）：
+           - cleanupscript 进程存在：按其 status/exit_code 判断
+             · status='completed' AND exit_code=0 → True（QG 通过）
+             · status='failed/killed' AND exit_code IS NOT NULL → False（真实失败）
+           - cleanupscript 尚未启动：
+             · codingagent 仍在运行 → None（等待）
+             · codingagent 刚以 exit_code=0 完成 → None（等待 VK 触发 cleanupscript）
+             · codingagent 以非 0 失败且 exit_code IS NOT NULL → False（cleanup 不会再触发）
         2. 若仓库未配置 cleanup_script：
-           - codingagent 进程 status='completed' AND exit_code=0 → True
-           - codingagent 进程 status='failed/killed' AND exit_code IS NOT NULL → False
+           - SQLite 无法判断 QG 结果；依赖 Path A（vk-hooks.sh → REST PATCH），返回 None
+           - 如果需要 SQLite 检测，请在 VK 仓库设置中配置 cleanup_script
         3. 进程运行中 / 未开始 / exit_code=NULL（VK 重启 artifact） → None
 
         Args:
@@ -180,7 +188,7 @@ class VKDatabase:
         Returns:
             True   — QG 通过，Dispatcher 可以触发 finish_coding → In review
             False  — Agent 真实失败，需要人工介入
-            None   — 仍在运行、尚未开始或无法判断（下轮再检查）
+            None   — 仍在运行、尚未开始、无 cleanup_script 或无法判断（下轮再检查）
         """
         cleanup = self.has_cleanup_script(branch)
 
@@ -207,12 +215,15 @@ class VKDatabase:
             # codingagent 以非 0 失败（exit_code IS NOT NULL），cleanup 不会再触发
             return self._evaluate_process(agent_proc, "codingagent(fallback)", branch)
         else:
-            # 无 cleanup_script：以 codingagent 完成为准
-            proc = self.get_latest_process(branch, RUN_REASON_CODING_AGENT)
-            if proc is None:
-                logger.debug("VKDatabase: 未找到分支 %s 的 codingagent 记录", branch)
-                return None
-            return self._evaluate_process(proc, "codingagent", branch)
+            # 无 cleanup_script：SQLite 无法判断 QG 是否通过
+            # codingagent 完成 ≠ QG 通过（Agent 可能未运行测试，或测试失败后仍退出）
+            # 依赖 Path A（agent-quality-gate.sh → vk-hooks.sh → REST PATCH）触发流转
+            # 如需 SQLite 自动检测，请在 VK 仓库设置中配置 cleanup_script
+            logger.debug(
+                "VKDatabase: 分支 %s 关联仓库未配置 cleanup_script，SQLite 无法判断 QG 结果",
+                branch,
+            )
+            return None
 
     def _evaluate_process(
         self, proc: dict, label: str, branch: str
