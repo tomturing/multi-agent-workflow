@@ -470,8 +470,8 @@ class Dispatcher:
 
         title = f"Review: {base_branch} ({reviewer})"
 
-        # 构建增强 prompt: 基础 prompt + PR 信息 + diff 范围
-        prompt = self._build_review_prompt(t, trace_id)
+        # 构建增强 prompt: 基础 prompt + PR 信息 + diff 范围 + 收尾动作
+        prompt = self._build_review_prompt(t, issue_id, trace_id)
 
         # ---- 幂等检查: 若已存在同名且已 provision 的 workspace，直接复用 ----
         # container_ref=null 表示 VK 创建了记录但从未真正启动 agent（如目录信任检查失败）
@@ -784,13 +784,16 @@ class Dispatcher:
 
         return "\n\n---\n\n".join(parts)
 
-    def _build_review_prompt(self, tracker: IssueTracker, trace_id: str) -> str | None:
-        """构建增强审查 prompt: 基础 prompt + PR 信息 + diff 范围
+    def _build_review_prompt(
+        self, tracker: IssueTracker, issue_id: str, trace_id: str
+    ) -> str | None:
+        """构建增强审查 prompt: 基础 prompt + PR 信息 + diff 范围 + 收尾动作
 
         审查 Agent 需要知道:
         1. PR URL（直接查看）
         2. diff 范围（应该审查哪些文件）
         3. 变更统计（影响范围）
+        4. 审查完成后如何通过 VK REST API 更新 Issue 状态
         """
         # 加载基础 prompt
         base_prompt = self._load_prompt(self.config.review_prompt_file) or ""
@@ -817,11 +820,35 @@ class Dispatcher:
                     f"审查命令: `git diff {self.config.main_branch}...{tracker.coding_branch}`\n"
                 )
 
-        if not pr_section and not diff_section:
-            return base_prompt if base_prompt else None
+        # 收尾动作: 审查完成后通过 VK REST 自动更新 Issue 状态
+        # dispatcher 注入 issue_id 和 status_id，避免 agent 自行查找
+        status_done_id = self.config.status_map.get("Done", "")
+        status_inprogress_id = self.config.status_map.get("In progress", "")
+        vk_port = self.config.vk_port
+        action_section = (
+            f"\n## 审查完成后的必要操作\n\n"
+            f"**完成审查报告后，你必须执行以下 curl 命令更新 Issue 状态，这是强制要求：**\n\n"
+            f"### 如果结论是 APPROVED：\n"
+            f"```bash\n"
+            f"curl -s -X PATCH http://localhost:{vk_port}/api/remote/issues/{issue_id} \\\ \n"
+            f"  -H 'Content-Type: application/json' \\\ \n"
+            f"  -d '{{\"status_id\": \"{status_done_id}\"}}' && echo '✓ Issue 已标记为 Done'\n"
+            f"```\n\n"
+            f"### 如果结论是 CHANGES_REQUESTED：\n"
+            f"```bash\n"
+            f"curl -s -X PATCH http://localhost:{vk_port}/api/remote/issues/{issue_id} \\\ \n"
+            f"  -H 'Content-Type: application/json' \\\ \n"
+            f"  -d '{{\"status_id\": \"{status_inprogress_id}\"}}' && echo '✓ Issue 已退回 In progress'\n"
+            f"```\n\n"
+            f"执行命令后确认 echo 输出成功即可，无需其他操作。\n"
+        )
 
-        enhanced = base_prompt + pr_section + diff_section
-        return enhanced[:3000]  # 限制总长度
+        if not pr_section and not diff_section:
+            base_only = (base_prompt + action_section) if base_prompt else None
+            return base_only[:5000] if base_only else None
+
+        enhanced = base_prompt + pr_section + diff_section + action_section
+        return enhanced[:5000]  # 限制总长度（放宽到 5000 以容纳 action_section）
 
     def _pull_main(self, trace_id: str):
         """合并后拉取最新主分支到本地"""
