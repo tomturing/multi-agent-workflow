@@ -672,6 +672,12 @@ class Dispatcher:
 
                 # 合并后拉取最新主分支到本地
                 self._pull_main(trace_id)
+
+                # 合并后清理 coding branch（本地 + 远程）
+                # 对应业界实践: GitHub "auto-delete head branch after merge"
+                # 只删此次 merge 的分支，不做全量扫描
+                if t.coding_branch:
+                    self._delete_merged_branch(t.coding_branch, trace_id, gh)
             else:
                 self._error_count += 1
                 logger.error(
@@ -693,6 +699,30 @@ class Dispatcher:
                 )
             else:
                 logger.error("[%s] PR #%d 合并失败: %s", trace_id, t.pr_number, e)
+
+    def _delete_merged_branch(
+        self, branch: str, trace_id: str, gh: "GitHubClient | None" = None
+    ):
+        """合并后清理分支（本地 + 远程），对应 GitHub auto-delete head branch"""
+        git = ["git", "-C", self.config.project_dir]
+
+        # 删除本地分支
+        try:
+            subprocess.run(
+                [*git, "branch", "-D", branch],
+                capture_output=True, text=True, check=True,
+            )
+            logger.info("[%s] 清理: 删除本地分支 %s", trace_id, branch)
+        except subprocess.CalledProcessError:
+            pass  # 分支不存在或已删除，忽略
+
+        # 删除远程分支（需要 GitHub client）
+        if gh:
+            try:
+                gh.delete_branch(branch)
+                logger.info("[%s] 清理: 删除远程分支 origin/%s", trace_id, branch)
+            except Exception as e:
+                logger.debug("[%s] 远程分支删除跳过 (%s): %s", trace_id, branch, e)
 
     def _action_merge_local(self, issue_id: str, trace_id: str):
         """回退动作: 本地 git merge（无 GitHub 时使用）"""

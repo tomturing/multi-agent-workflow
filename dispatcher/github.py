@@ -142,6 +142,21 @@ class GitHubClient:
             "PUT", f"/repos/{self.owner}/{self.repo}/pulls/{pr_number}/merge", data
         )
 
+    def delete_branch(self, branch: str) -> None:
+        """删除远程分支（对应 GitHub auto-delete head branch after merge）
+
+        使用 DELETE /repos/{owner}/{repo}/git/refs/heads/{branch}
+        分支不存在时静默忽略（404）。
+        """
+        try:
+            self._request(
+                "DELETE",
+                f"/repos/{self.owner}/{self.repo}/git/refs/heads/{branch}",
+            )
+        except GitHubAPIError as e:
+            if e.status != 404:
+                raise
+
     def add_pr_comment(self, pr_number: int, body: str) -> dict:
         """在 PR 上添加评论"""
         return self._request(
