@@ -264,3 +264,155 @@ class VKDatabase:
             branch, label, status, exit_code,
         )
         return False
+
+    def get_repo_scripts_by_id(self, repo_id: str) -> dict | None:
+        """按 repo_id 获取 setup_script / cleanup_script 的当前值。
+
+        用于 Dispatcher 在启动或定期检查时判断是否需要补全配置。
+
+        Returns:
+            dict 包含 name, setup_script, cleanup_script（值可能为 None 或空字符串）
+            若 repo 不存在则返回 None
+        """
+        sql = """
+            SELECT name, setup_script, cleanup_script
+            FROM repos
+            WHERE id = ?
+            LIMIT 1
+        """
+        try:
+            conn = self._connect()
+            try:
+                cursor = conn.execute(sql, (repo_id,))
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                return {
+                    "name": row[0],
+                    "setup_script": row[1],
+                    "cleanup_script": row[2],
+                }
+            finally:
+                conn.close()
+        except (FileNotFoundError, sqlite3.Error) as e:
+            logger.debug("VKDatabase.get_repo_scripts_by_id: 查询失败 (repo_id=%s): %s", repo_id, e)
+            return None
+
+    def get_worktree_path(self, branch: str) -> str | None:
+        """获取指定分支 workspace 的 container_ref（本地 worktree 路径）。
+
+        VK 将 worktree 路径写入 workspaces.container_ref，格式为：
+          /var/tmp/vibe-kanban/worktrees/{short-branch-name}
+
+        Returns:
+            worktree 绝对路径，若 workspace 不存在则返回 None
+        """
+        sql = """
+            SELECT container_ref
+            FROM workspaces
+            WHERE branch = ?
+            LIMIT 1
+        """
+        try:
+            conn = self._connect()
+            try:
+                cursor = conn.execute(sql, (branch,))
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                return row[0]  # 可能为 None（VK 尚未启动 agent 时）
+            finally:
+                conn.close()
+        except (FileNotFoundError, sqlite3.Error) as e:
+            logger.debug("VKDatabase.get_worktree_path: 查询失败 (branch=%s): %s", branch, e)
+            return None
+
+    def is_review_done(self, review_branch: str) -> "str | bool | None":
+        """检测审查 Agent 是否完成，并返回审查结论。
+
+        检测逻辑：
+        1. 确认审查 codingagent 已完成（exit_code=0）
+        2. 读取 coding_agent_turns.summary，查找标准结论标记：
+           - 包含 'APPROVED'            → 审查通过
+           - 包含 'CHANGES_REQUESTED'   → 需要修改
+        3. 若 codingagent 失败（exit_code IS NOT NULL AND exit_code != 0）→ False
+        4. 仍在运行 / 尚未启动 / 无法判断 → None
+
+        存储位置（源码已验证）：
+          VK 自动将 Agent 最终输出截取存入 coding_agent_turns.summary，
+          无需 Agent 主动触发，是可信的权威来源。
+
+        Returns:
+            'approved'           — 审查通过，可流转 Done
+            'changes_requested'  — 审查打回，可流转 In progress
+            False                — Agent 真实失败，等待人工介入
+            None                 — 仍在运行 / 尚未开始 / 无法判断
+        """
+        # 先检查 codingagent 进程是否完成
+        proc = self.get_latest_process(review_branch, RUN_REASON_CODING_AGENT)
+        if proc is None:
+            logger.debug("VKDatabase.is_review_done: 分支 %s 无进程记录", review_branch)
+            return None
+
+        agent_eval = self._evaluate_process(proc, "review-codingagent", review_branch)
+        if agent_eval is None:
+            # 仍在运行或 VK 重启 artifact
+            return None
+        if agent_eval is False:
+            # 真实失败
+            return False
+
+        # codingagent 已成功完成，读取 summary 判断结论
+        sql = """
+            SELECT cat.summary
+            FROM coding_agent_turns cat
+            JOIN execution_processes ep ON cat.execution_process_id = ep.id
+            JOIN sessions s ON ep.session_id = s.id
+            JOIN workspaces w ON s.workspace_id = w.id
+            WHERE w.branch = ?
+              AND ep.run_reason = ?
+              AND ep.dropped = FALSE
+              AND cat.summary IS NOT NULL
+              AND cat.summary != ''
+            ORDER BY cat.created_at DESC
+            LIMIT 1
+        """
+        try:
+            conn = self._connect()
+            try:
+                cursor = conn.execute(sql, (review_branch, RUN_REASON_CODING_AGENT))
+                row = cursor.fetchone()
+                if row is None:
+                    logger.debug(
+                        "VKDatabase.is_review_done: 分支 %s codingagent 已完成但无 summary",
+                        review_branch,
+                    )
+                    return None
+                summary = row[0]
+            finally:
+                conn.close()
+        except (FileNotFoundError, sqlite3.Error) as e:
+            logger.warning("VKDatabase.is_review_done: SQLite 查询失败 (branch=%s): %s", review_branch, e)
+            return None
+
+        # 解析标准结论标记（不区分大小写）
+        summary_upper = summary.upper()
+        if "APPROVED" in summary_upper and "CHANGES_REQUESTED" not in summary_upper:
+            logger.info(
+                "VKDatabase.is_review_done: 分支 %s 审查通过 ✓ (summary 前100字: %s)",
+                review_branch, summary[:100],
+            )
+            return "approved"
+        if "CHANGES_REQUESTED" in summary_upper:
+            logger.info(
+                "VKDatabase.is_review_done: 分支 %s 审查打回 (summary 前100字: %s)",
+                review_branch, summary[:100],
+            )
+            return "changes_requested"
+
+        # summary 存在但不含标准标记 → Agent 可能未加结论，保守返回 None
+        logger.debug(
+            "VKDatabase.is_review_done: 分支 %s summary 无标准结论标记，等待下轮 (summary 前100字: %s)",
+            review_branch, summary[:100],
+        )
+        return None
