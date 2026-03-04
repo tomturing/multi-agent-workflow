@@ -297,11 +297,12 @@ check_secrets() {
     fi
 
     # 扫描相对于 base 分支的变更（如果有的话）
-    local scan_mode="--all"
+    # 使用 --redact 模式避免敏感信息泄露到 CI 日志
+    local scan_mode="--all --redact"
     local base_branch="${VK_BASE_BRANCH:-main}"
     if git rev-parse --verify "$base_branch" &>/dev/null; then
         if git merge-base --is-ancestor "$base_branch" HEAD 2>/dev/null; then
-            scan_mode="--diff $base_branch"
+            scan_mode="--diff $base_branch --redact"
         fi
     fi
 

@@ -99,11 +99,12 @@ install_hooks() {
 # 自动生成，请勿手动编辑
 # ============================================================================
 
-# 获取脚本所在目录（支持符号链接）
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# 获取工作区根目录（支持 git worktree）
+# worktree 场景：.git 是文件而非目录，需用 git rev-parse 获取真实根目录
+PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
-# 执行 secret 扫描（只扫描 staged 文件）
-if ! bash "${SCRIPT_DIR}/scripts/scan-secrets.sh" --staged --quiet; then
+# 执行 secret 扫描（只扫描 staged 文件，使用脱敏模式避免日志泄露）
+if ! bash "${PROJECT_ROOT}/scripts/scan-secrets.sh" --staged --quiet --redact; then
     echo ""
     echo "❌ 提交被阻止：发现敏感信息"
     echo "   请移除敏感信息后重新提交"

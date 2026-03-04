@@ -31,7 +31,14 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # ---- 项目根目录 ----
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# 优先使用当前 git 仓库根目录（支持从外部仓库调用）
+# 如果当前目录不是 git 仓库，则使用脚本所在目录
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if git rev-parse --show-toplevel &>/dev/null; then
+    PROJECT_ROOT="$(git rev-parse --show-toplevel)"
+else
+    PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+fi
 cd "$PROJECT_ROOT"
 
 # ============================================================================
@@ -78,6 +85,7 @@ Secret Scanning — 扫描代码库中的敏感信息
   -a, --all         扫描所有 tracked 文件（默认）
   -d, --diff BASE   扫描相对于 BASE 分支的变更文件
   -q, --quiet       静默模式，只输出结果
+  -r, --redact      脱敏模式，只显示位置不显示内容（避免 CI 日志泄露）
   -h, --help        显示帮助信息
 
 示例:
@@ -102,6 +110,7 @@ EOF
 # ============================================================================
 MODE="all"
 QUIET=false
+REDACT=false
 TARGETS=()
 
 while [[ $# -gt 0 ]]; do
@@ -125,6 +134,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -q|--quiet)
             QUIET=true
+            shift
+            ;;
+        -r|--redact)
+            REDACT=true
             shift
             ;;
         -h|--help)
@@ -159,13 +172,26 @@ get_scan_files() {
         diff)
             # 扫描相对于 BASE 的变更
             local base="${DIFF_BASE:-main}"
-            # 确保 base 分支存在
+            # 确保 base 分支存在，依次尝试 main、master、HEAD
             if ! git rev-parse --verify "$base" &>/dev/null; then
-                base="master"
+                if git rev-parse --verify "master" &>/dev/null; then
+                    base="master"
+                else
+                    # 无法找到有效 base，回退到扫描所有文件
+                    base=""
+                fi
             fi
-            while IFS= read -r f; do
-                [[ -n "$f" ]] && files+=("$f")
-            done < <(git diff --name-only "$base"...HEAD 2>/dev/null || true)
+            if [[ -n "$base" ]]; then
+                while IFS= read -r f; do
+                    [[ -n "$f" ]] && files+=("$f")
+                done < <(git diff --name-only "$base"...HEAD 2>/dev/null || true)
+            fi
+            # 如果 diff 结果为空（可能是 base 不存在），回退到扫描所有 tracked 文件
+            if [[ ${#files[@]} -eq 0 ]]; then
+                while IFS= read -r f; do
+                    [[ -n "$f" ]] && files+=("$f")
+                done < <(git ls-files 2>/dev/null || true)
+            fi
             ;;
         all)
             if [[ ${#TARGETS[@]} -gt 0 ]]; then
@@ -209,9 +235,12 @@ scan_file() {
     # 检查文件是否存在且可读
     [[ -f "$file" && -r "$file" ]] || return 0
 
-    # 跳过二进制文件
-    if file "$file" 2>/dev/null | grep -qE 'binary|data'; then
-        return 0
+    # 跳过二进制文件：使用 grep -I 检测（-I 表示处理二进制文件时视为无匹配）
+    # 比 file + grep 方式更可靠，不会把 "JSON text data" 误判为二进制
+    if grep -Iq . "$file" 2>/dev/null; then
+        : # 文件包含可搜索文本，继续处理
+    else
+        return 0  # 二进制文件或空文件，跳过
     fi
 
     for pattern_def in "${SECRET_PATTERNS[@]}"; do
@@ -226,9 +255,15 @@ scan_file() {
             while IFS= read -r match; do
                 local line_num="${match%%:*}"
                 local line_content="${match#*:}"
-                # 截断过长的行
-                [[ ${#line_content} -gt 100 ]] && line_content="${line_content:0:100}..."
-                found_secrets+=("  ${CYAN}L${line_num}${NC}: ${line_content} ${YELLOW}[${name}]${NC}")
+
+                # 脱敏模式：只显示位置，不显示具体内容（避免 CI 日志泄露 token）
+                if $REDACT; then
+                    found_secrets+=("  ${CYAN}L${line_num}${NC}: [REDACTED] ${YELLOW}[${name}]${NC}")
+                else
+                    # 截断过长的行
+                    [[ ${#line_content} -gt 100 ]] && line_content="${line_content:0:100}..."
+                    found_secrets+=("  ${CYAN}L${line_num}${NC}: ${line_content} ${YELLOW}[${name}]${NC}")
+                fi
             done <<< "$matches"
         fi
     done
