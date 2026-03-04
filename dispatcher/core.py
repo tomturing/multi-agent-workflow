@@ -350,6 +350,7 @@ class Dispatcher:
             t = self._trackers[issue_id]
             t.review_workspace_id = None
             t.review_branch = None
+            t.last_qg_sha = self._get_branch_head_sha(t.coding_branch) or ""  # 防 CHANGES_REQUESTED ping-pong
             t.coding_workspace_id = None  # 清空以创建新 workspace
             t.in_progress_since = ""
             self._action_start_coding(issue_id, issue, trace_id)
