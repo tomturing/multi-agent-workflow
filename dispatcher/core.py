@@ -515,6 +515,20 @@ class Dispatcher:
                 self._action_merge_pr(issue_id, trace_id)
         else:
             # CHANGES_REQUESTED：清空编码 Session，重新创建
+            # 记录当前 coding branch SHA，防止同一 SHA 立即触发 QG → In review 的 ping-pong
+            # 编码 Agent 必须提交新代码（不同 SHA）后，issue 才能再次进入 In review
+            if t.coding_branch:
+                try:
+                    import subprocess as _sp
+                    _result = _sp.run(
+                        ["git", "-C", self.config.project_dir,
+                         "rev-parse", f"origin/{t.coding_branch}"],
+                        capture_output=True, text=True,
+                    )
+                    if _result.returncode == 0:
+                        t.last_qg_sha = _result.stdout.strip()
+                except Exception:
+                    pass
             t.coding_workspace_id = None
             t.coding_branch = None
             self.rest.update_issue_status(issue_id, "In progress", self.config.status_map)
@@ -1043,17 +1057,33 @@ class Dispatcher:
         # container_ref=null 表示 VK 创建了记录但从未真正启动 agent（如目录信任检查失败）
         existing = self.rest.find_workspace_by_title(title)
         if existing and existing.get("container_ref"):
-            ws_id = existing["id"]
-            branch_name = existing.get("branch")
-            t.review_workspace_id = ws_id
-            t.review_branch = branch_name
-            self._action_count += 1
-            self._save_state()
-            logger.info(
-                "[%s] ✓ 复用已有审查 Workspace: ws=%s",
-                trace_id, ws_id[:8],
-            )
-            return
+            # 若旧 review workspace 已有审查结论，不复用 —— 新建下一轮审查 Workspace
+            # 否则 is_review_done() 会持续读到旧结论，造成 ping-pong 循环
+            existing_branch = existing.get("branch")
+            if existing_branch and self.vk_db.is_review_done(existing_branch) is not None:
+                round_num = 2
+                new_title = f"Review: {base_branch} (round{round_num}) ({reviewer})"
+                while self.rest.find_workspace_by_title(new_title):
+                    round_num += 1
+                    new_title = f"Review: {base_branch} (round{round_num}) ({reviewer})"
+                title = new_title
+                logger.info(
+                    "[%s] 旧审查 Workspace (ws=%s) 已有结论，新建第 %s 轮: %s",
+                    trace_id, existing["id"][:8], round_num, title,
+                )
+                # Fall through to mcp.start_session()
+            else:
+                ws_id = existing["id"]
+                branch_name = existing.get("branch")
+                t.review_workspace_id = ws_id
+                t.review_branch = branch_name
+                self._action_count += 1
+                self._save_state()
+                logger.info(
+                    "[%s] ✓ 复用已有审查 Workspace: ws=%s",
+                    trace_id, ws_id[:8],
+                )
+                return
         elif existing:
             logger.info(
                 "[%s] 发现未 provision 的同名审查 Workspace (ws=%s container_ref=null)，忽略并重新创建",
