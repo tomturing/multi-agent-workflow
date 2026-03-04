@@ -285,6 +285,40 @@ check_frontend_lint() {
 }
 
 # ============================================================================
+# Secret 扫描
+# ============================================================================
+
+check_secrets() {
+    log_header "Secret 扫描（敏感信息检测）"
+    local scan_script="${PROJECT_ROOT}/scripts/scan-secrets.sh"
+
+    if [ ! -f "$scan_script" ]; then
+        log_skip "scan-secrets.sh 不存在"; return
+    fi
+
+    # 扫描相对于 base 分支的变更（如果有的话）
+    local scan_mode="--all"
+    local base_branch="${VK_BASE_BRANCH:-main}"
+    if git rev-parse --verify "$base_branch" &>/dev/null; then
+        if git merge-base --is-ancestor "$base_branch" HEAD 2>/dev/null; then
+            scan_mode="--diff $base_branch"
+        fi
+    fi
+
+    local ec=0
+    if bash "$scan_script" $scan_mode 2>/dev/null; then
+        log_pass "Secret 扫描 — 未发现敏感信息"
+    else
+        ec=$?
+        if [ $ec -eq 1 ]; then
+            log_fail "Secret 扫描 — 发现敏感信息！请检查并移除"
+        else
+            log_fail "Secret 扫描 — 执行异常 (exit=$ec)"
+        fi
+    fi
+}
+
+# ============================================================================
 # 主流程
 # ============================================================================
 
@@ -308,6 +342,9 @@ main() {
         $IS_PYTHON && ! $HAS_PYTHON_CHANGES && run_python=false
         $IS_FRONTEND && ! $HAS_FRONTEND_CHANGES && run_frontend=false
     fi
+
+    # Secret 扫描始终运行（安全第一）
+    check_secrets
 
     $run_python && { check_python_lint; check_python_format; check_python_test; }
     $run_frontend && check_frontend_lint

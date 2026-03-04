@@ -3,7 +3,7 @@
 # 多 Agent 工作流命令（由 multi-agent-workflow init.sh 自动添加）
 # ============================================================================
 
-.PHONY: vk vk-stop vk-restart quality-gate conflict-check post-merge dispatcher dispatcher-status
+.PHONY: vk vk-stop vk-restart quality-gate conflict-check post-merge dispatcher dispatcher-status scan-secrets install-hooks
 
 # VK 固定端口（避免每次重启端口变化导致 MCP 需要 Reload Window）
 VK_PORT ?= 9527
@@ -45,3 +45,15 @@ dispatcher-once:
 dispatcher-status:
 	@echo "调度器状态..."
 	VK_PORT=$(VK_PORT) python -m dispatcher --project-dir . status --cached
+
+scan-secrets:
+	@echo "扫描敏感信息..."
+	bash scripts/scan-secrets.sh
+
+scan-secrets-staged:
+	@echo "扫描 staged 文件中的敏感信息..."
+	bash scripts/scan-secrets.sh --staged
+
+install-hooks:
+	@echo "安装 Git hooks..."
+	bash scripts/install-hooks.sh
