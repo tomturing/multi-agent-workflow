@@ -7,6 +7,10 @@
 本仓库提供 **多 Agent 并行开发工作流** 的通用模板和初始化工具。
 支持 Claude Code、Codex CLI、Gemini CLI 三种 Agent，通过 Vibe Kanban 统一调度。
 
+> 文档导航：
+> - [需求说明](docs/01_需求说明.md) · [架构设计](docs/02_架构设计.md)
+> - [自动化能力对标与落地清单](docs/automation-benchmark-and-implementation-plan.md)
+
 ### 核心特性
 
 - **一键初始化**: `init.sh -p <project>` 快速为任何项目注入工作流

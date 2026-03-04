@@ -61,6 +61,49 @@ class VKRestClient:
         # VK REST API 响应结构: {success: true, data: {issues: [...]}}
         return data.get("data", {}).get("issues", [])
 
+    # ---- Workspace REST 辅助（/api/task-attempts 接口）----
+
+    def get_workspaces(self, title_filter: str | None = None) -> list[dict]:
+        """获取所有本地 workspace（未归档）。
+
+        注意: /api/task-attempts 返回 {success, data: [...]} 信封格式。
+        """
+        try:
+            resp = urllib.request.urlopen(
+                f"{self.base_url}/api/task-attempts", timeout=10
+            )
+            envelope: dict = json.loads(resp.read().decode())
+            # 解包信封: {success: true, data: [...]}
+            workspaces: list = envelope.get("data", [])
+            result = [ws for ws in workspaces if not ws.get("archived")]
+            if title_filter:
+                result = [ws for ws in result if ws.get("name") == title_filter]
+            return result
+        except Exception as e:
+            logger.warning("get_workspaces 失败: %s", e)
+            return []
+
+    def find_workspace_by_title(self, title: str) -> dict | None:
+        """按名称查找未归档的 workspace，返回第一个匹配项或 None"""
+        matches = self.get_workspaces(title_filter=title)
+        return matches[0] if matches else None
+
+    def archive_workspace(self, workspace_id: str) -> bool:
+        """将 workspace 标记为已归档"""
+        payload = json.dumps({"archived": True}).encode()
+        req = urllib.request.Request(
+            f"{self.base_url}/api/task-attempts/{workspace_id}",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="PATCH",
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=10)
+            return resp.status == 200
+        except Exception as e:
+            logger.warning("归档 workspace %s 失败: %s", workspace_id[:8], e)
+            return False
+
     def update_issue_status(
         self, issue_id: str, status_name: str, status_map: dict[str, str]
     ) -> bool:
@@ -115,17 +158,29 @@ class VKMCPClient:
     def connect(self) -> bool:
         """启动 MCP 子进程并完成协议握手
 
+        优先使用 ~/.vibe-kanban/bin/ 下的本地安装二进制（快速），
+        否则回退到 npx -y vibe-kanban@latest（需联网下载，慢）。
+
         握手流程:
-        1. 启动 npx vibe-kanban --mcp
+        1. 启动 vibe-kanban-mcp 进程
         2. 发送 initialize 请求
         3. 接收 initialize 响应
         4. 发送 notifications/initialized 通知
         """
-        env = {**os.environ, "PORT": str(self.port)}
+        env = {**os.environ, "PORT": str(self.port), "BACKEND_PORT": str(self.port)}
+
+        # 优先使用本地安装的二进制（避免 npx 重复下载，速度更快）
+        local_binary = self._find_local_mcp_binary()
+        if local_binary:
+            cmd = [local_binary]
+            logger.debug("使用本地 MCP 二进制: %s", local_binary)
+        else:
+            cmd = ["npx", "-y", "vibe-kanban@latest", "--mcp"]
+            logger.debug("回退使用 npx MCP")
 
         try:
             self._proc = subprocess.Popen(
-                ["npx", "-y", "vibe-kanban@latest", "--mcp"],
+                cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -158,6 +213,19 @@ class VKMCPClient:
         time.sleep(0.3)
         return True
 
+    @staticmethod
+    def _find_local_mcp_binary() -> str | None:
+        """查找本地安装的 vibe-kanban-mcp 二进制文件。
+
+        VK 安装路径: ~/.vibe-kanban/bin/<version>/<platform>/vibe-kanban-mcp
+        返回最新版本的路径，未找到则返回 None。
+        """
+        import glob
+        home = os.path.expanduser("~")
+        pattern = os.path.join(home, ".vibe-kanban", "bin", "*", "*", "vibe-kanban-mcp")
+        candidates = sorted(glob.glob(pattern))
+        return candidates[-1] if candidates else None
+
     def close(self):
         """关闭 MCP 子进程"""
         if self._proc:
@@ -178,8 +246,15 @@ class VKMCPClient:
         executor: str,
         issue_id: str | None = None,
         prompt_override: str | None = None,
+        rest_client: "VKRestClient | None" = None,
     ) -> str | None:
-        """创建 Workspace Session，返回 workspace_id"""
+        """创建 Workspace Session，返回 workspace_id。
+
+        已知行为 (PIT-VK-002):
+        VK MCP v0.1.22/0.1.23 中，start_workspace_session 实际创建成功但
+        MCP 层解析响应失败，返回 {success: false}，导致 result.workspace_id 为空。
+        兜底策略: MCP 调用后若未获得 ws_id，通过 REST API 按 title 查找刚创建的 workspace。
+        """
         args: dict = {
             "title": title,
             "repos": [{"repo_id": repo_id, "base_branch": base_branch}],
@@ -191,9 +266,21 @@ class VKMCPClient:
             args["prompt_override"] = prompt_override
 
         result = self._call_tool("start_workspace_session", args)
+        ws_id: str | None = None
         if result and isinstance(result, dict):
-            return result.get("workspace_id")
-        return None
+            ws_id = result.get("workspace_id")
+
+        # 兜底: MCP 解析失败时，从 REST API 查找（按 title 最新一条）
+        if not ws_id and rest_client:
+            time.sleep(1.5)  # 等待后端写库
+            matches = rest_client.get_workspaces(title_filter=title)
+            if matches:
+                # 取最新创建的
+                matches.sort(key=lambda w: w.get("created_at", ""), reverse=True)
+                ws_id = matches[0]["id"]
+                logger.info("start_session REST 兜底成功: ws_id=%s", ws_id[:8])
+
+        return ws_id
 
     def list_workspaces(self, organization_id: str) -> list[dict]:
         """列出组织下所有 Workspace

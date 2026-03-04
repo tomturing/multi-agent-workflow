@@ -372,6 +372,26 @@ class Dispatcher:
         title = issue.get("title", t.simple_id)
         prompt = self._build_coding_prompt(issue)
 
+        # ---- 幂等检查: 若已存在同名未归档 workspace，直接复用 ----
+        existing = self.rest.find_workspace_by_title(title)
+        if existing:
+            ws_id = existing["id"]
+            branch = existing.get("branch")
+            t.coding_workspace_id = ws_id
+            t.coding_branch = branch
+            t.coder_executor = executor
+            self._action_count += 1
+            self.rest.update_issue_status(
+                issue_id, "In progress", self.config.status_map
+            )
+            t.status = "In progress"
+            self._save_state()
+            logger.info(
+                "[%s] ✓ 复用已有编码 Workspace: ws=%s branch=%s",
+                trace_id, ws_id[:8], branch,
+            )
+            return
+
         mcp = VKMCPClient(port=self.config.vk_port)
         if not mcp.connect():
             self._error_count += 1
@@ -386,6 +406,7 @@ class Dispatcher:
                 executor=executor,
                 issue_id=issue_id,
                 prompt_override=prompt,
+                rest_client=self.rest,   # 兜底: MCP 解析失败时从 REST 获取 ws_id
             )
 
             if not ws_id:
