@@ -307,6 +307,30 @@ open('CLAUDE.md', 'w').write(content)
         log_ok "生成 CLAUDE.md"
     fi
 
+    # ---- Step 4.5: 注入 Dispatcher 健康检查 ----
+    log_header "Step 4.5: Dispatcher 健康检查"
+
+    local DISPATCHER_DIR="${SCRIPT_DIR}"
+    local PROJECT_DIR_ABS="$(realpath "$PROJECT_DIR")"
+
+    if [ -f "CLAUDE.md" ]; then
+        # 检查是否已注入（避免重复）
+        if grep -q "Dispatcher 健康检查" "CLAUDE.md" 2>/dev/null; then
+            log_skip "CLAUDE.md 中已包含 Dispatcher 健康检查"
+        else
+            # 追加健康检查片段，替换占位符
+            echo "" >> "CLAUDE.md"
+            sed \
+                -e "s|{{PROJECT_DIR}}|${PROJECT_DIR_ABS}|g" \
+                -e "s|{{DISPATCHER_DIR}}|${DISPATCHER_DIR}|g" \
+                -e "s|{{PROJECT_NAME}}|${PROJECT_NAME}|g" \
+                "${TEMPLATE_DIR}/claude_dispatcher_check.md" >> "CLAUDE.md"
+            log_ok "追加 Dispatcher 健康检查到 CLAUDE.md"
+        fi
+    else
+        log_skip "CLAUDE.md 不存在，跳过健康检查注入"
+    fi
+
     # ---- Step 5: 创建 AGENTS.md 符号链接 ----
     log_header "Step 5: AGENTS.md 符号链接"
 
