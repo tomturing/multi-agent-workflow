@@ -1,0 +1,28 @@
+{
+    "_comment_": "VK 中央调度器配置 — 请填写 TODO 处。运行 list_organizations / list_projects / list_repos 获取 ID。",
+    "organization_id": "2ac991e1-a835-41ff-bbc1-2605d25f8375",
+    "project_id": "65f08fde-be22-47d2-bae7-405dcf96685a",
+    "repo_id": "24e156dd-c300-4573-a234-c7d0ed619ec8",
+
+    "main_branch": "main",
+    "poll_interval": 30,
+    "vk_port": 9527,
+
+    "auto_start_coding": true,
+    "auto_start_review": true,
+    "auto_merge": true,
+    "auto_create_pr": true,
+
+    "pr_merge_method": "squash",
+    "pr_draft": false,
+    "pr_body_template": "## {simple_id}: {title}\n\n### 变更统计\n{diff_stat}\n\n_由 Dispatcher 自动创建_",
+
+    "default_coder_executor": "CLAUDE_CODE",
+    "cross_review_map": {
+        "CLAUDE_CODE": "CODEX",
+        "CODEX": "CLAUDE_CODE",
+        "GEMINI": "CODEX"
+    },
+    "coding_prompt_file": ".vk/prompts/coder.md",
+    "review_prompt_file": ".vk/prompts/reviewer.md"
+}

@@ -208,6 +208,11 @@ class Dispatcher:
 
         logger.info("VK 服务连接正常 ✓")
 
+        # status_map 为空时自动发现（项目首次启动 / status_map.json 丢失）
+        if not self.config.status_map:
+            logger.info("status_map 为空，开始自动发现状态映射...")
+            self._auto_discover_status_map()
+
         # 启动后状态校验：验证内存中记录的 workspace 在外部是否真实有效
         self._validate_state_on_startup()
 
@@ -863,14 +868,14 @@ class Dispatcher:
             f"**完成审查报告后，你必须执行以下 curl 命令更新 Issue 状态，这是强制要求：**\n\n"
             f"### 如果结论是 APPROVED：\n"
             f"```bash\n"
-            f"curl -s -X PATCH http://localhost:{vk_port}/api/remote/issues/{issue_id} \\\ \n"
-            f"  -H 'Content-Type: application/json' \\\ \n"
+            f"curl -s -X PATCH http://localhost:{vk_port}/api/remote/issues/{issue_id} \\\n"
+            f"  -H 'Content-Type: application/json' \\\n"
             f"  -d '{{\"status_id\": \"{status_done_id}\"}}' && echo '✓ Issue 已标记为 Done'\n"
             f"```\n\n"
             f"### 如果结论是 CHANGES_REQUESTED：\n"
             f"```bash\n"
-            f"curl -s -X PATCH http://localhost:{vk_port}/api/remote/issues/{issue_id} \\\ \n"
-            f"  -H 'Content-Type: application/json' \\\ \n"
+            f"curl -s -X PATCH http://localhost:{vk_port}/api/remote/issues/{issue_id} \\\n"
+            f"  -H 'Content-Type: application/json' \\\n"
             f"  -d '{{\"status_id\": \"{status_inprogress_id}\"}}' && echo '✓ Issue 已退回 In progress'\n"
             f"```\n\n"
             f"执行命令后确认 echo 输出成功即可，无需其他操作。\n"
@@ -1080,6 +1085,59 @@ class Dispatcher:
                 "启动 GC 完成: 清理 %d 个已合并分支，跳过 %d 个 ✓",
                 cleaned, skipped,
             )
+
+    def _auto_discover_status_map(self):
+        """自动发现并写入 status_map.json
+
+        两条路径（按优先级）：
+        1. 快速路径：从现有 Issue 中读取 status + status_id 字段（纯 REST，无 MCP）
+        2. 探针路径：无 Issue 时，通过 MCP 创建临时 Issue 循环各状态、读回 status_id
+
+        成功后写入 .vk/status_map.json 并热更新 config.status_map + _status_id_to_name。
+        """
+        project_id = self.config.project_id
+        status_map_path = os.path.join(self.config.project_dir, ".vk", "status_map.json")
+        standard_names = {"Backlog", "To do", "In progress", "In review", "Done", "Cancelled"}
+
+        # ---------- 快速路径 ----------
+        mapping = self.rest.get_status_map_from_issues(project_id)
+        if mapping.keys() >= standard_names:
+            logger.info(
+                "状态映射快速路径成功（%d/%d）",
+                len(mapping), len(standard_names),
+            )
+        else:
+            logger.info(
+                "快速路径不足（%d/%d 个状态），启用 MCP 探针路径...",
+                len(mapping), len(standard_names),
+            )
+            # ---------- 探针路径 ----------
+            mcp = VKMCPClient(port=self.config.vk_port)
+            if not mcp.connect():
+                logger.error("auto_discover: MCP 连接失败，无法完成状态发现")
+                return
+            try:
+                probe_map = mcp.discover_status_map(project_id, self.rest)
+                mapping.update(probe_map)
+            finally:
+                mcp.close()
+
+        if not mapping:
+            logger.error("auto_discover: 状态映射为空，请手动配置 .vk/status_map.json")
+            return
+
+        # 写入 status_map.json（持久化，下次启动直接加载）
+        try:
+            with open(status_map_path, "w", encoding="utf-8") as f:
+                json.dump(mapping, f, ensure_ascii=False, indent=2)
+            logger.info("status_map.json 已写入: %s 个状态 → %s", len(mapping), status_map_path)
+        except OSError as e:
+            logger.error("status_map.json 写入失败: %s", e)
+
+        # 热更新内存中的 config，后续轮询立即可用
+        self.config.status_map = mapping
+        self._status_id_to_name = {v: k for k, v in mapping.items()}
+        logger.info("✓ 状态映射热更新完成: %s", list(mapping.keys()))
 
     def _validate_state_on_startup(self):
         """启动时校验内存中记录的 workspace ID 是否真正 provisioned。

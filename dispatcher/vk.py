@@ -132,6 +132,32 @@ class VKRestClient:
             logger.error("更新状态失败: HTTP %d", e.code)
             return False
 
+    def get_issue(self, issue_id: str) -> dict | None:
+        """获取单个 Issue 详情（含 status_id 字段）"""
+        try:
+            resp = urllib.request.urlopen(
+                f"{self.base_url}/api/remote/issues/{issue_id}", timeout=10
+            )
+            data = json.loads(resp.read().decode())
+            return data.get("data", data)
+        except Exception as e:
+            logger.warning("get_issue %s 失败: %s", issue_id[:8], e)
+            return None
+
+    def get_status_map_from_issues(self, project_id: str) -> dict[str, str]:
+        """快速路径：从现有 Issue 中提取 status名称 → status_id 映射
+
+        不依赖 MCP，纯 REST；项目无 issue 时返回空字典。
+        """
+        issues = self.list_issues(project_id, limit=200)
+        mapping: dict[str, str] = {}
+        for issue in issues:
+            name = issue.get("status")
+            sid = issue.get("status_id")
+            if name and sid:
+                mapping[name] = sid
+        return mapping
+
 
 # ============================================================================
 #  VK MCP stdio 客户端
@@ -294,6 +320,60 @@ class VKMCPClient:
         if result and isinstance(result, dict):
             return result.get("workspaces", [])
         return []
+
+    def discover_status_map(
+        self,
+        project_id: str,
+        rest_client: "VKRestClient",
+        status_names: list[str] | None = None,
+    ) -> dict[str, str]:
+        """探针路径：创建临时 Issue，循环更新各状态，从 REST 读取 status_id。
+
+        适用场景：项目刚创建，无任何 Issue，无法用快速路径发现状态映射。
+        完成后会自动删除探针 Issue。
+        """
+        if status_names is None:
+            status_names = [
+                "Backlog", "To do", "In progress",
+                "In review", "Done", "Cancelled",
+            ]
+
+        # 创建临时探针 issue
+        result = self._call_tool("create_issue", {
+            "project_id": project_id,
+            "title": "__status_discovery_probe__",
+        })
+        if not result:
+            logger.error("创建探针 Issue 失败")
+            return {}
+
+        issue_id = result.get("id") or result.get("issue_id")
+        if not issue_id:
+            logger.error("探针 Issue 响应缺少 id: %s", result)
+            return {}
+
+        logger.info("创建状态探针 Issue: %s", issue_id[:8])
+        mapping: dict[str, str] = {}
+
+        try:
+            for status_name in status_names:
+                self._call_tool("update_issue", {
+                    "issue_id": issue_id,
+                    "status": status_name,
+                })
+                time.sleep(0.3)  # 等待后端写库
+                issue_data = rest_client.get_issue(issue_id)
+                if issue_data:
+                    sid = issue_data.get("status_id")
+                    actual_name = issue_data.get("status", status_name)
+                    if sid:
+                        mapping[actual_name] = sid
+                        logger.info("发现状态: %s → %s", actual_name, sid[:8])
+        finally:
+            self._call_tool("delete_issue", {"issue_id": issue_id})
+            logger.info("已删除探针 Issue: %s", issue_id[:8])
+
+        return mapping
 
     # ---- 内部方法 ----
 
