@@ -509,7 +509,7 @@ Dispatcher 将追踪状态持久化到 `.vk/dispatcher_state.json`，支持:
 | 分支清理 | 合并后自动删除 head branch | 合并时删本地+远程，启动 GC 补漏，`merged_at` 二次确认防误删 | ✅ 超出标准 |
 | 状态恢复 | 幂等操作，崩溃可恢复 | 启动校验 + `container_ref` 验证 + GC + 补偿机制 | ✅ 完整 |
 | 可观测性 | 结构化日志，trace_id 追踪 | `[trace_id]` 全链路日志 + 轮询/动作/错误统计 | ✅ 完整 |
-| 安全 | Token 不入库，分支权限隔离 | `.vk/github_token` 已在 `.gitignore` | ⚠️ 无 Secret Scanning |
+| 安全 | Token 不入库，分支权限隔离 | `.vk/github_token` 已在 `.gitignore` + Secret Scanning | ✅ 完整 |
 
 ### 主要缺口
 
@@ -518,8 +518,80 @@ Dispatcher 将追踪状态持久化到 `.vk/dispatcher_state.json`，支持:
 | P1 | 质量门禁无 GitHub Actions | CI 结果不在 PR 上体现，无法作为 merge 前置条件 |
 | P1 | 审查意见不写回 PR comment | GitHub PR 上看不到审查结论，审计链不完整 |
 | P2 | 主分支无保护规则 | Dispatcher 可绕过审查直接 merge |
-| P3 | 无 Secret Scanning | Token 泄露无感知 |
-| P3 | 无 pre-commit hook | Agent 可绕过本地质量门禁 |
+| ~~P3~~ | ~~无 Secret Scanning~~ | ~~Token 泄露无感知~~ — ✅ 已实现 |
+| P3 | 无 pre-commit hook 强制安装 | Agent 可绕过本地质量门禁（需手动 `make install-hooks`） |
+
+## 安全
+
+### Secret Scanning
+
+项目内置敏感信息扫描功能，防止 API keys、tokens 等 secret 意外提交到代码库。
+
+#### 两层防护
+
+1. **pre-commit hook**（推荐）
+   - 每次提交前自动扫描 staged 文件
+   - 发现 secret 时阻止提交
+
+   ```bash
+   # 安装 hooks
+   make install-hooks
+
+   # 检查 hooks 状态
+   bash scripts/install-hooks.sh --check
+   ```
+
+2. **质量门禁集成**
+   - `make quality-gate` 自动包含 secret 扫描
+   - Agent 完成编码后必须通过扫描才能触发状态流转
+
+#### 手动扫描
+
+```bash
+# 扫描所有 tracked 文件
+make scan-secrets
+
+# 只扫描 staged 文件（pre-commit 场景）
+make scan-secrets-staged
+
+# 扫描相对于 main 分支的变更
+bash scripts/scan-secrets.sh --diff main
+```
+
+#### 检测的 Secret 类型
+
+| 类型 | 模式 |
+|------|------|
+| GitHub classic token | `ghp_` + 36 字符 |
+| GitHub fine-grained token | `github_pat_` + 82 字符 |
+| OpenAI API key | `sk-` + 48 字符 |
+| Anthropic API key | `sk-ant-` + 95 字符 |
+| Google API key | `AIza` + 35 字符 |
+| 通用 Bearer token | `Bearer ` + 20+ 字符 |
+
+#### 处理泄露
+
+如果扫描发现 secret：
+
+1. **立即撤销** — 到对应平台重新生成 token
+2. **移除敏感信息** — 使用环境变量或密钥管理服务
+3. **清理历史** — 如已提交到 git，使用 `git filter-branch` 或 [BFG Repo-Cleaner](https://rtyley.github.io/bfg-repo-cleaner/) 清理
+
+> ⚠️ 即使 secret 在 `.gitignore` 中排除，也应避免写入代码文件。Agent 可能误提交或复制到其他位置。
+
+### GitHub Token 管理
+
+PR 创建和合并需要 GitHub Token（repo 权限）：
+
+```bash
+# 方式 1: 环境变量（推荐，CI 环境）
+export GITHUB_TOKEN=ghp_xxxx
+
+# 方式 2: 项目文件（自动被 .gitignore 排除）
+echo "ghp_xxxx" > .vk/github_token
+```
+
+> `scan-secrets.sh` 会扫描 tracked 文件，但 `.vk/github_token` 已在 `.gitignore` 中排除，不会被提交。
 
 ## License
 
