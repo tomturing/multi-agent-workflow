@@ -377,6 +377,30 @@ LOCALEOF
         fi
     fi
 
+    # ---- Step 10: pyproject.toml 自动生成（Python 项目）----
+    log_header "Step 10: pyproject.toml 自动生成"
+
+    # 检测是否为 Python 项目
+    local is_python_project=false
+    if [ -f "pyproject.toml" ] || [ -f "setup.py" ] || [ -f "setup.cfg" ]; then
+        is_python_project=true
+    elif find . -maxdepth 2 -name "*.py" -not -path "./.git/*" 2>/dev/null | grep -q .; then
+        is_python_project=true
+    fi
+
+    if $is_python_project && [ ! -f "pyproject.toml" ]; then
+        log_info "检测到 Python 项目但无 pyproject.toml，自动生成最小配置"
+        sed \
+            -e "s|{{PROJECT_NAME}}|${PROJECT_NAME}|g" \
+            -e "s|{{PROJECT_DESCRIPTION}}|${project_description}|g" \
+            "${TEMPLATE_DIR}/pyproject.toml.tmpl" > "pyproject.toml"
+        log_ok "生成 pyproject.toml（请根据项目需求补充依赖）"
+    elif [ -f "pyproject.toml" ]; then
+        log_skip "pyproject.toml（已存在）"
+    else
+        log_info "非 Python 项目，跳过 pyproject.toml 生成"
+    fi
+
     # ---- 完成 ----
     log_header "✅ 初始化完成"
     echo ""
@@ -392,16 +416,27 @@ LOCALEOF
     echo "    .vscode/mcp.json       — VS Code MCP Server 配置（VK 连接）"
     echo "    scripts/               — 自动化脚本（质量门禁、VK 钩子等）"
     echo "    dispatcher/            — 中央调度器模块（自动化编排引擎）"
+    if [ -f "pyproject.toml" ]; then
+        echo "    pyproject.toml         — Python 项目配置（自动生成）"
+    fi
     echo ""
     echo -e "  ${BOLD}下一步:${NC}"
     echo "    1. 检查 CLAUDE.md，完善所有 TODO 标注的项目定制内容"
-    echo "    2. 按需修改 scripts/agent-quality-gate.sh 中的 lint/test 命令"
+    echo "    2. 如有 pyproject.toml，运行 'uv sync --dev' 安装开发依赖"
     echo "    3. 启动 Vibe Kanban: make vk (或 npx vibe-kanban)"
     echo "    4. 在 VS Code 中 Reload Window 以激活 MCP Server"
     echo "    5. 填写 .vk/dispatcher.json 中的 organization_id / project_id / repo_id"
     echo "    6. 填写 .vk/status_map.json（从 VK MCP list_issue_priorities 获取）"
     echo "    7. 启动调度器: make dispatcher (或 python -m dispatcher)"
     echo "    8. 提交到 git: git add . && git commit -m '初始化多 Agent 工作流'"
+    echo ""
+    echo -e "  ${BOLD}质量门禁:${NC}"
+    echo "    scripts/agent-quality-gate.sh 现已支持自动探测："
+    echo "    - Python (ruff check/format, pytest)"
+    echo "    - Node.js (pnpm lint/test)"
+    echo "    - Go (go vet, go test)"
+    echo "    - Rust (cargo clippy, fmt, test)"
+    echo "    运行: bash scripts/agent-quality-gate.sh"
     echo ""
 }
 
