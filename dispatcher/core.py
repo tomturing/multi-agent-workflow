@@ -179,6 +179,7 @@ class Dispatcher:
         self.config = config
         self.dry_run = dry_run
         self.rest = VKRestClient(port=config.vk_port)
+        self.vk_db = VKDatabase()  # SQLite 直读：QG 检测、审查结论检测
 
         # Issue 跟踪状态: issue_id → IssueTracker
         self._trackers: dict[str, IssueTracker] = {}
