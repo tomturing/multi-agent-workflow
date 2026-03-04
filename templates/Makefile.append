@@ -3,13 +3,23 @@
 # 多 Agent 工作流命令（由 multi-agent-workflow init.sh 自动添加）
 # ============================================================================
 
-.PHONY: vk quality-gate conflict-check post-merge dispatcher dispatcher-status
+.PHONY: vk vk-stop vk-restart quality-gate conflict-check post-merge dispatcher dispatcher-status
 
 # VK 固定端口（避免每次重启端口变化导致 MCP 需要 Reload Window）
 VK_PORT ?= 9527
 
 vk:
 	@echo "启动 Vibe Kanban（端口 $(VK_PORT)）..."
+	PORT=$(VK_PORT) npx vibe-kanban
+
+vk-stop:
+	@echo "停止 Vibe Kanban..."
+	@pkill -f "vibe-kanban" 2>/dev/null && echo "✓ VK 已停止" || echo "VK 未在运行"
+
+vk-restart:
+	@echo "重启 Vibe Kanban..."
+	@pkill -f "vibe-kanban" 2>/dev/null || true
+	@sleep 1
 	PORT=$(VK_PORT) npx vibe-kanban
 
 quality-gate:

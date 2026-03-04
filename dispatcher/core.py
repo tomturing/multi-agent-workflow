@@ -208,6 +208,9 @@ class Dispatcher:
 
         logger.info("VK 服务连接正常 ✓")
 
+        # 启动后状态校验：验证内存中记录的 workspace 在外部是否真实有效
+        self._validate_state_on_startup()
+
         try:
             while True:
                 self.poll_once()
@@ -372,9 +375,11 @@ class Dispatcher:
         title = issue.get("title", t.simple_id)
         prompt = self._build_coding_prompt(issue)
 
-        # ---- 幂等检查: 若已存在同名未归档 workspace，直接复用 ----
+        # ---- 幂等检查: 若已存在同名且已 provision 的 workspace，直接复用 ----
+        # container_ref=null 表示 VK 创建了记录但从未真正启动 agent（如目录信任检查失败）
+        # 这类 "死" workspace 不能复用，否则 agent 永远不会运行
         existing = self.rest.find_workspace_by_title(title)
-        if existing:
+        if existing and existing.get("container_ref"):
             ws_id = existing["id"]
             branch = existing.get("branch")
             t.coding_workspace_id = ws_id
@@ -391,6 +396,11 @@ class Dispatcher:
                 trace_id, ws_id[:8], branch,
             )
             return
+        elif existing:
+            logger.info(
+                "[%s] 发现未 provision 的同名编码 Workspace (ws=%s container_ref=null)，忽略并重新创建",
+                trace_id, existing["id"][:8],
+            )
 
         mcp = VKMCPClient(port=self.config.vk_port)
         if not mcp.connect():
@@ -463,9 +473,10 @@ class Dispatcher:
         # 构建增强 prompt: 基础 prompt + PR 信息 + diff 范围
         prompt = self._build_review_prompt(t, trace_id)
 
-        # ---- 幂等检查: 若已存在同名未归档 workspace，直接复用 ----
+        # ---- 幂等检查: 若已存在同名且已 provision 的 workspace，直接复用 ----
+        # container_ref=null 表示 VK 创建了记录但从未真正启动 agent（如目录信任检查失败）
         existing = self.rest.find_workspace_by_title(title)
-        if existing:
+        if existing and existing.get("container_ref"):
             ws_id = existing["id"]
             branch_name = existing.get("branch")
             t.review_workspace_id = ws_id
@@ -477,6 +488,11 @@ class Dispatcher:
                 trace_id, ws_id[:8],
             )
             return
+        elif existing:
+            logger.info(
+                "[%s] 发现未 provision 的同名审查 Workspace (ws=%s container_ref=null)，忽略并重新创建",
+                trace_id, existing["id"][:8],
+            )
 
         mcp = VKMCPClient(port=self.config.vk_port)
         if not mcp.connect():
@@ -913,6 +929,62 @@ class Dispatcher:
             logger.info("加载调度状态: %d 个 Issue", len(self._trackers))
         except (json.JSONDecodeError, TypeError) as e:
             logger.warning("调度状态文件损坏，重新初始化: %s", e)
+
+    def _validate_state_on_startup(self):
+        """启动时校验内存中记录的 workspace ID 是否真正 provisioned。
+
+        container_ref=null 表示 VK 创建了数据库记录但从未真正启动 agent
+        （常见原因：codex trust-check 失败、网络超时等）。
+        这类"死" workspace 不能复用，应清空让补偿逻辑重新创建。
+        """
+        try:
+            all_workspaces = self.rest.get_workspaces()
+        except Exception as e:
+            logger.warning("启动校验: 获取 workspace 列表失败，跳过校验: %s", e)
+            return
+
+        ws_map = {w["id"]: w for w in all_workspaces}
+        invalidated = 0
+
+        for issue_id, t in self._trackers.items():
+            for attr, label in [
+                ("coding_workspace_id", "编码"),
+                ("review_workspace_id", "审查"),
+            ]:
+                ws_id = getattr(t, attr)
+                if not ws_id:
+                    continue
+                ws = ws_map.get(ws_id)
+                if ws is None:
+                    # VK 里找不到该 workspace（可能已被手动删除）
+                    logger.warning(
+                        "启动校验: %s 的%s Workspace %s 在 VK 中不存在，清空引用",
+                        t.simple_id or issue_id[:8], label, ws_id[:8],
+                    )
+                    setattr(t, attr, None)
+                    if attr == "review_workspace_id":
+                        t.review_branch = None
+                    elif attr == "coding_workspace_id":
+                        t.coding_branch = None
+                    invalidated += 1
+                elif not ws.get("container_ref"):
+                    # 记录存在但未被 provision（container_ref=null）
+                    logger.warning(
+                        "启动校验: %s 的%s Workspace %s container_ref=null（未被 provision），清空引用",
+                        t.simple_id or issue_id[:8], label, ws_id[:8],
+                    )
+                    setattr(t, attr, None)
+                    if attr == "review_workspace_id":
+                        t.review_branch = None
+                    elif attr == "coding_workspace_id":
+                        t.coding_branch = None
+                    invalidated += 1
+
+        if invalidated:
+            self._save_state()
+            logger.info("启动校验完成: 清空 %d 个无效 workspace 引用 ✓", invalidated)
+        else:
+            logger.info("启动校验完成: 所有 workspace 引用有效 ✓")
 
     def _save_state(self):
         """持久化调度状态到 JSON 文件"""
