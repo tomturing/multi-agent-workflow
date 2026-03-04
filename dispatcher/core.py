@@ -211,6 +211,9 @@ class Dispatcher:
         # 启动后状态校验：验证内存中记录的 workspace 在外部是否真实有效
         self._validate_state_on_startup()
 
+        # 启动后 branch GC：清理因 dispatcher crash 等原因漏删的已合并分支
+        self._gc_merged_branches()
+
         try:
             while True:
                 self.poll_once()
@@ -986,6 +989,97 @@ class Dispatcher:
             logger.info("加载调度状态: %d 个 Issue", len(self._trackers))
         except (json.JSONDecodeError, TypeError) as e:
             logger.warning("调度状态文件损坏，重新初始化: %s", e)
+
+    def _gc_merged_branches(self):
+        """启动时 GC：扫描本地 vk/ 前缀分支，清理已合并的漏删分支。
+
+        流程:
+        1. 列出本地所有 vk/ 前缀分支
+        2. 通过 GitHub API 查询每个分支对应的 PR
+        3. PR merged=True → 安全删除（本地 + 远程）
+        4. PR open/closed(not merged) 或无 PR → 跳过，避免误删
+
+        这是 GitHub 官方 "auto-delete head branches" 功能的 dispatcher 等价实现，
+        专门兜底 dispatcher crash 导致的漏删场景。
+        """
+        git = ["git", "-C", self.config.project_dir]
+        try:
+            result = subprocess.run(
+                [*git, "branch", "--format=%(refname:short)"],
+                capture_output=True, text=True, check=True,
+            )
+            vk_branches = [
+                b.strip() for b in result.stdout.splitlines()
+                if b.strip().startswith("vk/")
+            ]
+        except subprocess.CalledProcessError as e:
+            logger.warning("GC: 获取本地分支列表失败: %s", e)
+            return
+
+        if not vk_branches:
+            return
+
+        try:
+            gh = GitHubClient.from_project(self.config.project_dir)
+        except GitHubAPIError as e:
+            logger.info("GC: 无法连接 GitHub，跳过远程分支清理 (%s)", e)
+            gh = None
+
+        # 已被 dispatcher 记录为 coding_branch 且 issue 未完成的分支 → 跳过
+        active_branches = {
+            t.coding_branch for t in self._trackers.values()
+            if t.coding_branch and not t.merged
+        }
+
+        cleaned = 0
+        skipped = 0
+        for branch in vk_branches:
+            if branch in active_branches:
+                # 对应 issue 尚未完成，绝对不删
+                continue
+
+            should_delete = False
+
+            if gh:
+                # 二次确认：查 PR 状态，只删 merged 的
+                try:
+                    pr = gh.find_pr_by_head_branch(branch)
+                    if pr and pr.get("merged_at"):
+                        should_delete = True
+                    elif pr:
+                        # PR 存在但未合并（open 或 closed-not-merged）→ 不删
+                        skipped += 1
+                        logger.debug("GC: 跳过 %s (PR #%d state=%s)", branch, pr["number"], pr["state"])
+                    else:
+                        # 没有对应 PR（孤儿分支）且不在活跃列表 → 也删
+                        should_delete = True
+                except Exception as e:
+                    logger.debug("GC: 查询 PR 失败，跳过 %s: %s", branch, e)
+                    skipped += 1
+            else:
+                # 无 GitHub 连接：不删，避免误删
+                skipped += 1
+
+            if should_delete:
+                try:
+                    subprocess.run(
+                        [*git, "branch", "-D", branch],
+                        capture_output=True, text=True, check=True,
+                    )
+                    if gh:
+                        try:
+                            gh.delete_branch(branch)
+                        except Exception:
+                            pass  # 远程可能已不存在
+                    cleaned += 1
+                except subprocess.CalledProcessError:
+                    skipped += 1
+
+        if cleaned or skipped:
+            logger.info(
+                "启动 GC 完成: 清理 %d 个已合并分支，跳过 %d 个 ✓",
+                cleaned, skipped,
+            )
 
     def _validate_state_on_startup(self):
         """启动时校验内存中记录的 workspace ID 是否真正 provisioned。

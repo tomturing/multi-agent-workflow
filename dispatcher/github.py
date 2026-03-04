@@ -187,6 +187,22 @@ class GitHubClient:
             url += f"&head={head}"
         return self._request("GET", url)
 
+    def find_pr_by_head_branch(self, branch: str) -> dict | None:
+        """通过 head branch 名查找 PR（包含已关闭/已合并）
+
+        用于删前二次确认：验证 PR 确实处于 merged 状态再删分支。
+        state=all 确保覆盖 merged/closed 两种结束态。
+        """
+        if ":" not in branch:
+            branch = f"{self.owner}:{branch}"
+        result = self._request(
+            "GET",
+            f"/repos/{self.owner}/{self.repo}/pulls?state=all&head={branch}&per_page=1",
+        )
+        if isinstance(result, list) and result:
+            return result[0]
+        return None
+
     # ---- Git 操作（本地 + push）----
 
     @staticmethod
