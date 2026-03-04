@@ -463,6 +463,21 @@ class Dispatcher:
         # 构建增强 prompt: 基础 prompt + PR 信息 + diff 范围
         prompt = self._build_review_prompt(t, trace_id)
 
+        # ---- 幂等检查: 若已存在同名未归档 workspace，直接复用 ----
+        existing = self.rest.find_workspace_by_title(title)
+        if existing:
+            ws_id = existing["id"]
+            branch_name = existing.get("branch")
+            t.review_workspace_id = ws_id
+            t.review_branch = branch_name
+            self._action_count += 1
+            self._save_state()
+            logger.info(
+                "[%s] ✓ 复用已有审查 Workspace: ws=%s",
+                trace_id, ws_id[:8],
+            )
+            return
+
         mcp = VKMCPClient(port=self.config.vk_port)
         if not mcp.connect():
             self._error_count += 1
@@ -477,6 +492,7 @@ class Dispatcher:
                 executor=reviewer,
                 issue_id=issue_id,
                 prompt_override=prompt,
+                rest_client=self.rest,  # 兜底: MCP 解析失败时从 REST 获取 ws_id
             )
 
             if not ws_id:
@@ -822,9 +838,9 @@ class Dispatcher:
         return None
 
     def _find_branch(self, mcp: VKMCPClient, workspace_id: str) -> str | None:
-        """通过 MCP 查找 Workspace 对应的分支名"""
+        """查找 Workspace 对应的分支名（优先 REST，MCP list_workspaces 在 v0.1.22/23 失效）"""
         try:
-            workspaces = mcp.list_workspaces(self.config.organization_id)
+            workspaces = self.rest.get_workspaces()
             for ws in workspaces:
                 if ws.get("id") == workspace_id:
                     return ws.get("branch")
@@ -842,12 +858,8 @@ class Dispatcher:
         2. Workspace name 包含 Issue simple_id
         3. Workspace name 模糊匹配 Issue title 前缀
         """
-        mcp = VKMCPClient(port=self.config.vk_port)
-        if not mcp.connect():
-            return None
-
         try:
-            workspaces = mcp.list_workspaces(self.config.organization_id)
+            workspaces = self.rest.get_workspaces()
             if not workspaces:
                 return None
 
@@ -883,8 +895,6 @@ class Dispatcher:
 
         except Exception as e:
             logger.error("[%s] Workspace 查询失败: %s", trace_id, e)
-        finally:
-            mcp.close()
 
         return None
 
