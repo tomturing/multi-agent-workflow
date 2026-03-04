@@ -61,6 +61,9 @@ class DispatcherConfig:
     auto_start_review: bool = True  # In review → 自动启动审查
     auto_merge: bool = True  # Done → 自动通过 GitHub API 合并 PR
 
+    # ---- 可选: 质量门禁兜底配置 ----
+    qg_fallback_timeout_seconds: int = 600  # Agent 超时未运行 QG 后 Dispatcher 兜底的等待秒数
+
     # ---- 可选: PR 配置 ----
     pr_merge_method: str = "squash"  # 合并方式: squash / merge / rebase
     pr_draft: bool = False  # 是否创建为 Draft PR
@@ -129,6 +132,7 @@ class DispatcherConfig:
             ),
             coding_prompt_file=data.get("coding_prompt_file", ".vk/prompts/coder.md"),
             review_prompt_file=data.get("review_prompt_file", ".vk/prompts/reviewer.md"),
+            qg_fallback_timeout_seconds=int(data.get("qg_fallback_timeout_seconds", 600)),
             status_map=status_map,
         )
 
@@ -214,6 +218,9 @@ class Dispatcher:
             return
 
         logger.info("VK 服务连接正常 ✓")
+
+        # 安装 pre-push hook（幂等，主仓库 hooks 对所有 worktrees 生效）
+        self._ensure_precommit_hook_installed()
 
         # status_map 为空时自动发现（项目首次启动 / status_map.json 丢失）
         if not self.config.status_map:
@@ -456,6 +463,142 @@ class Dispatcher:
             )
         finally:
             mcp.close()
+
+    # ---- 质量门禁辅助方法 ----
+
+    def _is_coding_done(self, branch: str) -> bool:
+        """检查编码分支是否有新提交（相对于主分支）。"""
+        try:
+            result = subprocess.run(
+                ["git", "-C", self.config.project_dir,
+                 "rev-list", f"{self.config.main_branch}..{branch}", "--count"],
+                capture_output=True, text=True, timeout=10,
+            )
+            count = int(result.stdout.strip()) if result.returncode == 0 else 0
+            return count > 0
+        except Exception:
+            return False
+
+    def _get_branch_head_sha(self, branch: str) -> str | None:
+        """获取分支最新 commit SHA"""
+        try:
+            result = subprocess.run(
+                ["git", "-C", self.config.project_dir, "rev-parse", branch],
+                capture_output=True, text=True, timeout=10,
+            )
+            return result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            return None
+
+    def _is_qg_passed(self, sha: str) -> bool:
+        """检查指定 commit 是否已有 QG 通过标记文件"""
+        marker = os.path.join(self.config.project_dir, ".vk", "qg_passed", sha)
+        return os.path.exists(marker)
+
+    def _get_worktree_project_path(self, ws_id: str) -> str | None:
+        """通过 workspace_id 从 VK REST 获取 worktree 内的项目目录路径。"""
+        ws = self.rest.get_workspace_by_id(ws_id)
+        if not ws:
+            return None
+        container_ref = ws.get("container_ref")
+        if not container_ref:
+            return None
+        agent_dir = ws.get("agent_working_dir", "")
+        return os.path.join(container_ref, agent_dir) if agent_dir else container_ref
+
+    def _action_finish_coding(self, issue_id: str, issue: dict, trace_id: str):
+        """QG 已通过 -> 更新 Issue 状态为 In review 并立即触发 PR 创建。"""
+        if self.dry_run:
+            logger.info("[%s] [DRY-RUN] 跳过 finish_coding", trace_id)
+            return
+        t = self._trackers[issue_id]
+        self.rest.update_issue_status(issue_id, "In review", self.config.status_map)
+        t.status = "In review"
+        self._action_count += 1
+        self._save_state()
+        logger.info("[%s] %s: 编码完成 -> In review", trace_id, t.simple_id)
+        if self.config.auto_create_pr:
+            self._action_create_pr(issue_id, issue, trace_id)
+
+    def _action_run_quality_gate_fallback(
+        self, issue_id: str, issue: dict, trace_id: str
+    ):
+        """兜底动作: Dispatcher 在 worktree 中代为运行质量门禁。
+
+        触发条件: Agent 超时未自行运行 QG（pre-push hook 未触发 / --no-verify）。
+        成功: 写入 SHA 标记文件 -> 流转 In review。
+        失败: 重置计时器（N 分钟后再试），不强制流转（质量是底线）。
+        """
+        if self.dry_run:
+            logger.info("[%s] [DRY-RUN] 跳过兜底 QG", trace_id)
+            return
+
+        t = self._trackers[issue_id]
+        worktree_path = self._get_worktree_project_path(t.coding_workspace_id)
+        if not worktree_path:
+            logger.warning("[%s] %s: 无法获取 worktree 路径，跳过兜底 QG", trace_id, t.simple_id)
+            return
+
+        gate_script = os.path.join(worktree_path, "scripts", "agent-quality-gate.sh")
+        if not os.path.exists(gate_script):
+            logger.warning("[%s] %s: agent-quality-gate.sh 不在 worktree，跳过", trace_id, t.simple_id)
+            return
+
+        logger.info("[%s] %s: Dispatcher 兜底运行 QG (worktree=%s)", trace_id, t.simple_id, worktree_path)
+        try:
+            result = subprocess.run(
+                ["bash", gate_script],
+                cwd=worktree_path,
+                capture_output=True, text=True, timeout=300,
+                env={**os.environ, "VK_SKIP_STATUS_UPDATE": "1"},
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("[%s] %s: 兜底 QG 超时 (300s)", trace_id, t.simple_id)
+            t.in_progress_since = datetime.now(UTC).isoformat()
+            self._save_state()
+            return
+
+        if result.returncode == 0:
+            sha = self._get_branch_head_sha(t.coding_branch)
+            if sha:
+                marker_dir = os.path.join(self.config.project_dir, ".vk", "qg_passed")
+                os.makedirs(marker_dir, exist_ok=True)
+                open(os.path.join(marker_dir, sha), "w").close()
+                logger.info("[%s] %s: 兜底 QG 通过，标记已写入 (%s)", trace_id, t.simple_id, sha[:8])
+            self._action_finish_coding(issue_id, issue, trace_id)
+        else:
+            tail = (result.stdout + result.stderr)[-600:].strip()
+            logger.warning("[%s] %s: 兜底 QG 失败 (exit=%d)，重置计时器\n%s",
+                           trace_id, t.simple_id, result.returncode, tail)
+            t.in_progress_since = datetime.now(UTC).isoformat()
+            self._save_state()
+
+    def _ensure_precommit_hook_installed(self):
+        """在主项目 .git/hooks/ 安装 pre-push hook（幂等）。
+
+        主仓库的 hooks 对所有 git worktrees 自动生效。
+        """
+        hook_path = os.path.join(self.config.project_dir, ".git", "hooks", "pre-push")
+        hook_source = os.path.join(self.config.project_dir, "scripts", "vk-pre-push-hook.sh")
+
+        if not os.path.exists(hook_source):
+            logger.debug("vk-pre-push-hook.sh 不存在，跳过 hook 安装")
+            return
+
+        if os.path.exists(hook_path):
+            try:
+                existing = open(hook_path).read()
+                if "vk-pre-push-hook.sh" in existing or "VK" in existing:
+                    return
+            except Exception:
+                pass
+
+        os.makedirs(os.path.dirname(hook_path), exist_ok=True)
+        with open(hook_path, "w") as f:
+            f.write(f'''#!/usr/bin/env bash\nexec bash "{hook_source}" "$@"\n''')
+        import stat as _stat
+        os.chmod(hook_path, os.stat(hook_path).st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
+        logger.info("pre-push hook 已安装: %s -> %s", hook_path, hook_source)
 
     def _action_start_review(self, issue_id: str, issue: dict, trace_id: str):
         """动作: 创建交叉审查 Session，prompt 中注入 PR URL 和 diff 范围"""
@@ -840,6 +983,20 @@ class Dispatcher:
             issue_section += f"\n{description}\n"
 
         parts.append(issue_section)
+
+        # 4. 强制 QG 步骤（无论 Agent 是否记得，都在 prompt 最后明确要求）
+        parts.append(
+            "## 完成编码后的必要步骤\n\n"
+            "代码修改并 commit 后，**必须运行以下命令**：\n\n"
+            "```bash\n"
+            "bash scripts/agent-quality-gate.sh\n"
+            "```\n\n"
+            "该脚本将自动完成：\n"
+            "1. 代码 lint 和格式化检查（ruff / eslint）\n"
+            "2. 单元测试\n"
+            "3. 通过后调用 `vk-hooks.sh` 推送分支 + 更新 Issue 状态（In review）\n\n"
+            "**不要跳过此步骤** —— 这是工作流状态机的触发器，跳过会导致 Issue 卡在 \"In progress\"。"
+        )
 
         if not parts:
             return None

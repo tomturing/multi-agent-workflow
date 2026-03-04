@@ -167,7 +167,23 @@ vk_on_cleanup_success() {
             # 编码完成: 先推送分支到 GitHub，再更新状态
             # Dispatcher 检测到 In review 后会自动创建 PR + 启动审查 Session
             _vk_push_branch || true
-            _vk_update_issue_status "$issue_id" "In review" || true
+
+            # 写入 QG 通过标记（供 Dispatcher 兜底机制识别）
+            local sha
+            sha=$(git -C "${_VK_PROJECT_ROOT}" rev-parse HEAD 2>/dev/null)
+            if [ -n "$sha" ]; then
+                mkdir -p "${_VK_PROJECT_ROOT}/.vk/qg_passed"
+                touch "${_VK_PROJECT_ROOT}/.vk/qg_passed/${sha}"
+                echo -e "  \033[0;32m✓\033[0m QG 标记已写入: ${sha:0:8}"
+            fi
+
+            # 若 Dispatcher 兜底模式（VK_SKIP_STATUS_UPDATE=1），跳过 REST 状态更新
+            # Dispatcher 自行明确踟进 In review，避免与 REST 之间突变
+            if [ "${VK_SKIP_STATUS_UPDATE:-0}" = "1" ]; then
+                echo -e "  ℹ VK_SKIP_STATUS_UPDATE=1，跳过状态更新（Dispatcher 处理）"
+            else
+                _vk_update_issue_status "$issue_id" "In review" || true
+            fi
             ;;
     esac
 }
