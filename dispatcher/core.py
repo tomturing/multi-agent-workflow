@@ -164,6 +164,7 @@ class IssueTracker:
     merged: bool = False
     # 时间戳
     updated_at: str = ""
+    in_progress_since: str = ""  # 首次发现有提交时的时间戳（用于 QG 超时兜底计时）
 
 
 # ============================================================================
@@ -378,6 +379,50 @@ class Dispatcher:
         if t.status == "Done" and self.config.auto_merge and not t.pr_merged and t.pr_number:
             logger.info("[%s] ▸ %s: 补偿 — Done 但 PR 未合并", trace_id, t.simple_id)
             self._action_merge_pr(issue_id, trace_id)
+
+        # In progress + 编码分支有提交 → 三态 QG 检查
+        if (
+            t.status == "In progress"
+            and t.coding_workspace_id
+            and t.coding_branch
+            and not t.pr_number
+            and self._is_coding_done(t.coding_branch)
+        ):
+            sha = self._get_branch_head_sha(t.coding_branch)
+            if sha and self._is_qg_passed(sha):
+                # ① QG 标记存在（Agent 或 Dispatcher 兜底已通过）→ 直接流转
+                logger.info(
+                    "[%s] ▸ %s: QG 标记存在 (%s)，移入 In review",
+                    trace_id, t.simple_id, sha[:8],
+                )
+                self._action_finish_coding(issue_id, issue, trace_id)
+            elif not t.in_progress_since:
+                # ② 首次发现有提交，记录时间，等待 Agent 自行运行 QG
+                t.in_progress_since = datetime.now(UTC).isoformat()
+                self._save_state()
+                logger.info(
+                    "[%s] %s: 编码分支 %s 有新提交，等待 Agent 运行 QG (超时=%ds)",
+                    trace_id, t.simple_id, t.coding_branch,
+                    self.config.qg_fallback_timeout_seconds,
+                )
+            else:
+                # ③ 已等待一段时间，检查是否超时
+                elapsed = (
+                    datetime.now(UTC)
+                    - datetime.fromisoformat(t.in_progress_since)
+                ).total_seconds()
+                if elapsed >= self.config.qg_fallback_timeout_seconds:
+                    logger.info(
+                        "[%s] %s: 等待 QG 超时 (%.0fs)，Dispatcher 兜底运行 QG",
+                        trace_id, t.simple_id, elapsed,
+                    )
+                    self._action_run_quality_gate_fallback(issue_id, issue, trace_id)
+                else:
+                    logger.debug(
+                        "[%s] %s: 等待 Agent 运行 QG (已等 %.0fs / %ds)",
+                        trace_id, t.simple_id, elapsed,
+                        self.config.qg_fallback_timeout_seconds,
+                    )
 
     # ---- 编排动作 ----
 
