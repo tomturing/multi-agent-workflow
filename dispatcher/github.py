@@ -73,8 +73,7 @@ class GitHubClient:
 
         if not token:
             raise GitHubAPIError(
-                "未找到 GitHub Token。设置 GITHUB_TOKEN 环境变量 "
-                "或创建 .vk/github_token 文件"
+                "未找到 GitHub Token。设置 GITHUB_TOKEN 环境变量 或创建 .vk/github_token 文件"
             )
 
         return cls(owner, repo, token)
@@ -219,8 +218,11 @@ class GitHubClient:
             cmd.append("--force")
 
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, check=True,
+            subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
             )
             logger.info("推送分支 %s → origin", branch)
             return True
@@ -229,9 +231,7 @@ class GitHubClient:
             return False
 
     @staticmethod
-    def generate_diff(
-        project_dir: str, base: str, head: str, stat_only: bool = False
-    ) -> str:
+    def generate_diff(project_dir: str, base: str, head: str, stat_only: bool = False) -> str:
         """生成两个分支之间的 diff
 
         Args:
@@ -250,7 +250,10 @@ class GitHubClient:
 
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, check=True,
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
             )
             return result.stdout
         except subprocess.CalledProcessError:
@@ -269,7 +272,9 @@ class GitHubClient:
         try:
             result = subprocess.run(
                 ["git", "-C", project_dir, "remote", "get-url", "origin"],
-                capture_output=True, text=True, check=True,
+                capture_output=True,
+                text=True,
+                check=True,
             )
             url = result.stdout.strip()
         except subprocess.CalledProcessError:
@@ -293,9 +298,7 @@ class GitHubClient:
 
         raise GitHubAPIError(f"无法解析 GitHub remote URL: {url}")
 
-    def _request(
-        self, method: str, path: str, data: dict | None = None
-    ) -> dict | list:
+    def _request(self, method: str, path: str, data: dict | None = None) -> dict | list:
         """发送 GitHub API 请求"""
         url = f"{self.API_BASE}{path}" if path.startswith("/") else path
 

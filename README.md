@@ -493,6 +493,34 @@ Dispatcher 将追踪状态持久化到 `.vk/dispatcher_state.json`，支持:
 - 补偿机制：首次启动时检测已有 Issue 的遗漏动作
 - 分支信息记录：自动关联 Issue → workspace → 分支名
 
+## 与业界最佳实践对比
+
+### 总览
+
+| 阶段 | 业界最佳实践 | 本项目实现 | 完成度 |
+|------|------------|-----------|--------|
+| 需求/规划 | Issue 驱动，结构化描述，任务拆分 | VK Issue + Copilot Plan Mode 分解，`simple_id` 贯穿全程 | ✅ 完整 |
+| 分支策略 | Feature branch + 主分支保护规则 | `vk/<id>-<slug>` 自动命名，dispatcher 管理生命周期 | ⚠️ 无主分支保护规则 |
+| 编码规范 | 规范注入 + 最小变更原则 | `coder.md` + `CLAUDE.md` + Issue 上下文三层 prompt 注入 | ✅ 完整 |
+| 质量门禁 | GitHub Actions，PR 上体现 CI 状态 | `agent-quality-gate.sh` 本地执行，通过后才触发状态流转 | ⚠️ 无 CI，不产生 PR Check |
+| Code Review | 四眼原则，APPROVED / CHANGES_REQUESTED，意见写回 PR | 交叉审查矩阵（不同 Agent 审查），注入 PR diff，结构化 checklist | ⚠️ 审查意见不写回 GitHub PR comment |
+| PR 管理 | 自动创建，包含 diff 统计和上下文 | Dispatcher 自动创建，注入 diff 统计 + PR URL | ✅ 完整 |
+| 合并策略 | Squash merge，commit message 结构化 | Squash merge via GitHub API，title = `{simple_id}: {title}` | ✅ 完整 |
+| 分支清理 | 合并后自动删除 head branch | 合并时删本地+远程，启动 GC 补漏，`merged_at` 二次确认防误删 | ✅ 超出标准 |
+| 状态恢复 | 幂等操作，崩溃可恢复 | 启动校验 + `container_ref` 验证 + GC + 补偿机制 | ✅ 完整 |
+| 可观测性 | 结构化日志，trace_id 追踪 | `[trace_id]` 全链路日志 + 轮询/动作/错误统计 | ✅ 完整 |
+| 安全 | Token 不入库，分支权限隔离 | `.vk/github_token` 已在 `.gitignore` | ⚠️ 无 Secret Scanning |
+
+### 主要缺口
+
+| 优先级 | 缺口 | 影响 |
+|--------|------|------|
+| P1 | 质量门禁无 GitHub Actions | CI 结果不在 PR 上体现，无法作为 merge 前置条件 |
+| P1 | 审查意见不写回 PR comment | GitHub PR 上看不到审查结论，审计链不完整 |
+| P2 | 主分支无保护规则 | Dispatcher 可绕过审查直接 merge |
+| P3 | 无 Secret Scanning | Token 泄露无感知 |
+| P3 | 无 pre-commit hook | Agent 可绕过本地质量门禁 |
+
 ## License
 
 MIT

@@ -78,17 +78,20 @@ def main():
 
     # 全局参数
     parser.add_argument(
-        "--project-dir", "-d",
+        "--project-dir",
+        "-d",
         default=os.getcwd(),
         help="目标项目根目录 (默认: 当前目录)",
     )
     parser.add_argument(
-        "--config", "-c",
+        "--config",
+        "-c",
         default=".vk/dispatcher.json",
         help="配置文件路径，相对于 project-dir (默认: .vk/dispatcher.json)",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="显示 DEBUG 级别日志",
     )
@@ -103,9 +106,7 @@ def main():
 
     # status 子命令
     p_status = sub.add_parser("status", help="显示当前调度状态")
-    p_status.add_argument(
-        "--cached", action="store_true", help="仅显示缓存状态，不轮询"
-    )
+    p_status.add_argument("--cached", action="store_true", help="仅显示缓存状态，不轮询")
     p_status.set_defaults(func=cmd_status)
 
     args = parser.parse_args()
