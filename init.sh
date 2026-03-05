@@ -238,12 +238,15 @@ main() {
     log_header "Step 3: 复制通用工作流文件"
 
     # .vk/ 目录
-    mkdir -p .vk/prompts .vk/reports
+    mkdir -p .vk/prompts .vk/reports .vk/logs
     safe_copy "${TEMPLATE_DIR}/vk/workflow.md" ".vk/workflow.md"
     safe_copy "${TEMPLATE_DIR}/vk/prompts/coder.md" ".vk/prompts/coder.md"
     safe_copy "${TEMPLATE_DIR}/vk/prompts/reviewer.md" ".vk/prompts/reviewer.md"
     safe_copy "${TEMPLATE_DIR}/vk/prompts/planner.md" ".vk/prompts/planner.md"
     safe_copy "${TEMPLATE_DIR}/vk/reports/.gitignore" ".vk/reports/.gitignore"
+    # dev.sh — 一键启动守护脚本（含 VK 健康等待 + Dispatcher 异常通知）
+    safe_copy "${TEMPLATE_DIR}/dev.sh" ".vk/dev.sh"
+    chmod +x .vk/dev.sh 2>/dev/null || true
 
     # scripts/
     mkdir -p scripts
@@ -396,11 +399,12 @@ LOCALEOF
     echo -e "  ${BOLD}下一步:${NC}"
     echo "    1. 检查 CLAUDE.md，完善所有 TODO 标注的项目定制内容"
     echo "    2. 按需修改 scripts/agent-quality-gate.sh 中的 lint/test 命令"
-    echo "    3. 启动 Vibe Kanban: make vk (或 npx vibe-kanban)"
-    echo "    4. 在 VS Code 中 Reload Window 以激活 MCP Server"
-    echo "    5. 填写 .vk/dispatcher.json 中的 organization_id / project_id / repo_id"
-    echo "    6. 填写 .vk/status_map.json（从 VK MCP list_issue_priorities 获取）"
-    echo "    7. 启动调度器: make dispatcher (或 python -m dispatcher)"
+    echo "    3. 填写 .vk/dispatcher.json 中的 organization_id / project_id / repo_id"
+    echo "    4. 填写 .vk/status_map.json（从 VK MCP list_issue_priorities 获取）"
+    echo "    5. 在 VS Code 中 Reload Window 以激活 MCP Server"
+    echo "    6. 一键启动 VK + Dispatcher: make dev-up"
+    echo "       （含健康检查等待、异常 Toast 通知；日志在 .vk/logs/）"
+    echo "    7. 停止: make dev-down | 查看日志: make dev-logs"
     echo "    8. 提交到 git: git add . && git commit -m '初始化多 Agent 工作流'"
     echo ""
 }
