@@ -23,6 +23,14 @@ TEMPLATE_DIR="${SCRIPT_DIR}/templates"
 SCRIPTS_DIR="${SCRIPT_DIR}/scripts"
 WORKSPACE_DIR="$(dirname "$SCRIPT_DIR")"  # multi-agent-workflow 的父目录
 
+# ---- realpath fallback ----
+# 某些系统（如 macOS）可能没有 realpath 命令
+if command -v realpath &>/dev/null; then
+    _realpath() { realpath "$1"; }
+else
+    _realpath() { python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1"; }
+fi
+
 # ---- 默认值 ----
 PROJECT_NAME=""
 NON_INTERACTIVE=false
@@ -238,12 +246,18 @@ main() {
     log_header "Step 3: 复制通用工作流文件"
 
     # .vk/ 目录
-    mkdir -p .vk/prompts .vk/reports
+    mkdir -p .vk/prompts .vk/reports .vk/logs
     safe_copy "${TEMPLATE_DIR}/vk/workflow.md" ".vk/workflow.md"
     safe_copy "${TEMPLATE_DIR}/vk/prompts/coder.md" ".vk/prompts/coder.md"
     safe_copy "${TEMPLATE_DIR}/vk/prompts/reviewer.md" ".vk/prompts/reviewer.md"
     safe_copy "${TEMPLATE_DIR}/vk/prompts/planner.md" ".vk/prompts/planner.md"
     safe_copy "${TEMPLATE_DIR}/vk/reports/.gitignore" ".vk/reports/.gitignore"
+    # dev.sh — 一键启动守护脚本（含 VK 健康等待 + Dispatcher 异常通知）
+    safe_copy "${TEMPLATE_DIR}/dev.sh" ".vk/dev.sh"
+    chmod +x .vk/dev.sh 2>/dev/null || true
+    # maw_dir — 记录 MAW 安装路径，供 dev.sh 在 dispatcher 未复制时回退使用
+    echo "${SCRIPT_DIR}" > ".vk/maw_dir"
+    log_ok "写入 .vk/maw_dir → ${SCRIPT_DIR}"
 
     # scripts/
     mkdir -p scripts
@@ -305,6 +319,43 @@ open('CLAUDE.md', 'w').write(content)
         fi
 
         log_ok "生成 CLAUDE.md"
+    fi
+
+    # ---- Step 4.5: 注入 Dispatcher 健康检查到 CLAUDE.md ----
+    log_header "Step 4.5: Dispatcher 健康检查"
+
+    # 检查是否已注入（通过标记检测）
+    if grep -q "Dispatcher 健康检查" "CLAUDE.md" 2>/dev/null; then
+        log_skip "CLAUDE.md 中已包含 Dispatcher 健康检查"
+    else
+        # 使用 Python 进行安全的模板渲染（避免 sed 转义问题）
+        if command -v python3 &>/dev/null; then
+            local PROJECT_DIR_ABS="$(_realpath "$PROJECT_DIR")"
+            local DISPATCHER_DIR_ABS="$(_realpath "$SCRIPT_DIR")"
+            local PROJECT_NAME_SAFE="$(basename "$PROJECT_DIR")"
+
+            python3 -c "
+import sys
+
+# 读取模板
+with open('${TEMPLATE_DIR}/claude_dispatcher_check.md', 'r') as f:
+    template = f.read()
+
+# 安全替换占位符（无需转义，Python 字符串替换自动处理特殊字符）
+content = template.replace('{{PROJECT_DIR}}', '''$PROJECT_DIR_ABS''')
+content = content.replace('{{DISPATCHER_DIR}}', '''$DISPATCHER_DIR_ABS''')
+content = content.replace('{{PROJECT_NAME}}', '''$PROJECT_NAME_SAFE''')
+
+# 追加到 CLAUDE.md
+with open('CLAUDE.md', 'a') as f:
+    f.write('\n')
+    f.write(content)
+
+print('  ✓ 注入 Dispatcher 健康检查到 CLAUDE.md')
+"
+        else
+            log_skip "Python3 不可用，跳过 Dispatcher 健康检查注入"
+        fi
     fi
 
     # ---- Step 5: 创建 AGENTS.md 符号链接 ----
@@ -396,11 +447,12 @@ LOCALEOF
     echo -e "  ${BOLD}下一步:${NC}"
     echo "    1. 检查 CLAUDE.md，完善所有 TODO 标注的项目定制内容"
     echo "    2. 按需修改 scripts/agent-quality-gate.sh 中的 lint/test 命令"
-    echo "    3. 启动 Vibe Kanban: make vk (或 npx vibe-kanban)"
-    echo "    4. 在 VS Code 中 Reload Window 以激活 MCP Server"
-    echo "    5. 填写 .vk/dispatcher.json 中的 organization_id / project_id / repo_id"
-    echo "    6. 填写 .vk/status_map.json（从 VK MCP list_issue_priorities 获取）"
-    echo "    7. 启动调度器: make dispatcher (或 python -m dispatcher)"
+    echo "    3. 填写 .vk/dispatcher.json 中的 organization_id / project_id / repo_id"
+    echo "    4. 填写 .vk/status_map.json（从 VK MCP list_issue_priorities 获取）"
+    echo "    5. 在 VS Code 中 Reload Window 以激活 MCP Server"
+    echo "    6. 一键启动 VK + Dispatcher: make dev-up"
+    echo "       （含健康检查等待、异常 Toast 通知；日志在 .vk/logs/）"
+    echo "    7. 停止: make dev-down | 查看日志: make dev-logs"
     echo "    8. 提交到 git: git add . && git commit -m '初始化多 Agent 工作流'"
     echo ""
 }

@@ -29,6 +29,7 @@ from datetime import UTC, datetime
 
 from .github import GitHubAPIError, GitHubClient
 from .vk import VKMCPClient, VKRestClient
+from .vk_db import VKDatabase
 
 logger = logging.getLogger("dispatcher")
 
@@ -60,9 +61,6 @@ class DispatcherConfig:
     auto_create_pr: bool = True  # 编码完成 → 自动创建 PR 并推送到 GitHub
     auto_start_review: bool = True  # In review → 自动启动审查
     auto_merge: bool = True  # Done → 自动通过 GitHub API 合并 PR
-
-    # ---- 可选: 质量门禁兜底配置 ----
-    qg_fallback_timeout_seconds: int = 600  # Agent 超时未运行 QG 后 Dispatcher 兜底的等待秒数
 
     # ---- 可选: PR 配置 ----
     pr_merge_method: str = "squash"  # 合并方式: squash / merge / rebase
@@ -132,7 +130,6 @@ class DispatcherConfig:
             ),
             coding_prompt_file=data.get("coding_prompt_file", ".vk/prompts/coder.md"),
             review_prompt_file=data.get("review_prompt_file", ".vk/prompts/reviewer.md"),
-            qg_fallback_timeout_seconds=int(data.get("qg_fallback_timeout_seconds", 600)),
             status_map=status_map,
         )
 
@@ -164,8 +161,9 @@ class IssueTracker:
     merged: bool = False
     # 时间戳
     updated_at: str = ""
-    in_progress_since: str = ""  # 首次发现有提交时的时间戳（用于 QG 超时兜底计时）
-    last_qg_sha: str = ""        # 上一次通过 QG 并流转到 In review 的 SHA（防 ping-pong）
+    # 多轮编码跟踪
+    coding_round: int = 1  # 当前编码轮次（CHANGES_REQUESTED 后递增），用于生成唯一 Workspace 标题
+    review_feedback: str = ""  # 上一轮审查 Agent 的反馈（CHANGES_REQUESTED 时由 SQLite 读取）
 
 
 # ============================================================================
@@ -187,6 +185,7 @@ class Dispatcher:
         self.config = config
         self.dry_run = dry_run
         self.rest = VKRestClient(port=config.vk_port)
+        self.vk_db = VKDatabase()  # SQLite 直读：QG 检测、审查结论检测
 
         # Issue 跟踪状态: issue_id → IssueTracker
         self._trackers: dict[str, IssueTracker] = {}
@@ -196,6 +195,9 @@ class Dispatcher:
         self._poll_count = 0
         self._action_count = 0
         self._error_count = 0
+        # VK repo 配置自修复：每 _REPO_CFG_CHECK_INTERVAL 轮检查一次
+        self._REPO_CFG_CHECK_INTERVAL = 10
+        self._repo_cfg_last_check = 0  # 上次检查的 poll_count
 
         # 反向 status_map: status_id (UUID) → status 名称
         # VK REST API 返回 status_id，不返回状态名称
@@ -309,6 +311,11 @@ class Dispatcher:
         # 每轮结束都持久化，保证补偿检查跨进程生效（首次发现 + 状态变化均覆盖）
         self._save_state()
 
+        # 定期检查 VK repo setup/cleanup_script 配置（E-CFG）
+        if self._poll_count - self._repo_cfg_last_check >= self._REPO_CFG_CHECK_INTERVAL:
+            self._ensure_repo_vk_config(trace_id)
+            self._repo_cfg_last_check = self._poll_count
+
         logger.info(
             "[%s] 轮询 #%d: %d issues, %d 变化 (累计: %d 动作, %d 错误)",
             trace_id,
@@ -345,14 +352,14 @@ class Dispatcher:
                 self._action_start_review(issue_id, issue, trace_id)
 
         elif new_status == "In progress" and old_status == "In review":
-            # CHANGES_REQUESTED: 审查退回 → 清空审查 Session，重置编码轮次
+            # CHANGES_REQUESTED: 审查退回 → 清空审查 Session，递增编码轮次，启动新编码
             logger.info("[%s] ▸ %s: CHANGES_REQUESTED → 重启编码轮次", trace_id, sid)
             t = self._trackers[issue_id]
+            t.coding_round = (t.coding_round or 1) + 1  # 递增轮次，使标题唯一
+            t.review_feedback = ""  # 人工退回时无法自动获取 feedback
             t.review_workspace_id = None
             t.review_branch = None
-            t.last_qg_sha = self._get_branch_head_sha(t.coding_branch) or ""  # 防 CHANGES_REQUESTED ping-pong
-            t.coding_workspace_id = None  # 清空以创建新 workspace
-            t.in_progress_since = ""
+            t.coding_workspace_id = None  # 清空，让 _action_start_coding 创建新 workspace
             self._action_start_coding(issue_id, issue, trace_id)
 
         elif new_status == "Done" and self.config.auto_merge:
@@ -372,6 +379,42 @@ class Dispatcher:
             self._action_start_coding(issue_id, issue, trace_id)
             return  # 已触发，不继续检查其他补偿
 
+        # In progress + 无编码 Session → 补偿启动编码
+        # 场景: 状态文件损坏/重置后重载，或 workspace provision 失败被清空
+        if (
+            t.status == "In progress"
+            and self.config.auto_start_coding
+            and not t.coding_workspace_id
+        ):
+            logger.info(
+                "[%s] ▸ %s: 补偿 — In progress 但无编码 Session，重启编码", trace_id, t.simple_id
+            )
+            self._action_start_coding(issue_id, issue, trace_id)
+            return
+
+        # In progress + 有编码 Session → SQLite 三态检查 QG 结论
+        if t.status == "In progress" and t.coding_workspace_id and t.coding_branch:
+            qg_result = self.vk_db.is_qg_passed(t.coding_branch)
+            if qg_result is True:
+                # cleanup_script completed + exit_code=0 → QG 通过，流转 In review
+                logger.info(
+                    "[%s] ▸ %s: SQLite 检测到 QG 通过 (branch=%s)，移入 In review",
+                    trace_id,
+                    t.simple_id,
+                    t.coding_branch,
+                )
+                self._action_finish_coding(issue_id, issue, trace_id)
+            elif qg_result is False:
+                # cleanup_script 真实失败（非 dropped）→ 等待人工介入
+                logger.warning(
+                    "[%s] %s: QG 失败（SQLite 检测），请人工介入 (branch=%s)",
+                    trace_id,
+                    t.simple_id,
+                    t.coding_branch,
+                )
+            # None → codingagent/cleanupscript 仍在运行，下轮再检查
+            return
+
         # In review 但无 PR → 补偿创建 PR
         if (
             t.status == "In review"
@@ -381,6 +424,36 @@ class Dispatcher:
         ):
             logger.info("[%s] ▸ %s: 补偿 — In review 但无 PR", trace_id, t.simple_id)
             self._action_create_pr(issue_id, issue, trace_id)
+
+        # In review + 有审查 Session → 读 SQLite summary 检测审查结论（E45-计划）
+        if t.status == "In review" and t.review_workspace_id and t.review_branch:
+            review_result = self.vk_db.is_review_done(t.review_branch)
+            if review_result == "approved":
+                logger.info(
+                    "[%s] ▸ %s: SQLite 检测到审查通过 (branch=%s)，移入 Done",
+                    trace_id,
+                    t.simple_id,
+                    t.review_branch,
+                )
+                self._action_finish_review(issue_id, issue, trace_id, approved=True)
+                return
+            elif review_result == "changes_requested":
+                logger.info(
+                    "[%s] ▸ %s: SQLite 检测到审查打回 (branch=%s)，移入 In progress",
+                    trace_id,
+                    t.simple_id,
+                    t.review_branch,
+                )
+                self._action_finish_review(issue_id, issue, trace_id, approved=False)
+                return
+            elif review_result is False:
+                logger.warning(
+                    "[%s] %s: 审查 Agent 真实失败（SQLite 检测），请人工介入 (branch=%s)",
+                    trace_id,
+                    t.simple_id,
+                    t.review_branch,
+                )
+            # None → 仍在运行，下轮再检查
 
         # In review 但无审查 Session → 补偿创建
         if t.status == "In review" and self.config.auto_start_review and not t.review_workspace_id:
@@ -392,51 +465,127 @@ class Dispatcher:
             logger.info("[%s] ▸ %s: 补偿 — Done 但 PR 未合并", trace_id, t.simple_id)
             self._action_merge_pr(issue_id, trace_id)
 
-        # In progress + 编码分支有提交 → 三态 QG 检查
-        if (
-            t.status == "In progress"
-            and t.coding_workspace_id
-            and t.coding_branch
-            and self._is_coding_done(t.coding_branch)
-        ):
-            sha = self._get_branch_head_sha(t.coding_branch)
-            if sha and self._is_qg_passed(sha) and sha != t.last_qg_sha:
-                # ① QG 标记存在（Agent 或 Dispatcher 兜底已通过）→ 直接流转
-                logger.info(
-                    "[%s] ▸ %s: QG 标记存在 (%s)，移入 In review",
-                    trace_id, t.simple_id, sha[:8],
-                )
-                t.last_qg_sha = sha  # 记录，防 CHANGES_REQUESTED 后 ping-pong
-                self._action_finish_coding(issue_id, issue, trace_id)
-            elif not t.in_progress_since:
-                # ② 首次发现有提交，记录时间，等待 Agent 自行运行 QG
-                t.in_progress_since = datetime.now(UTC).isoformat()
-                self._save_state()
-                logger.info(
-                    "[%s] %s: 编码分支 %s 有新提交，等待 Agent 运行 QG (超时=%ds)",
-                    trace_id, t.simple_id, t.coding_branch,
-                    self.config.qg_fallback_timeout_seconds,
-                )
-            else:
-                # ③ 已等待一段时间，检查是否超时
-                elapsed = (
-                    datetime.now(UTC)
-                    - datetime.fromisoformat(t.in_progress_since)
-                ).total_seconds()
-                if elapsed >= self.config.qg_fallback_timeout_seconds:
-                    logger.info(
-                        "[%s] %s: 等待 QG 超时 (%.0fs)，Dispatcher 兜底运行 QG",
-                        trace_id, t.simple_id, elapsed,
-                    )
-                    self._action_run_quality_gate_fallback(issue_id, issue, trace_id)
-                else:
-                    logger.debug(
-                        "[%s] %s: 等待 Agent 运行 QG (已等 %.0fs / %ds)",
-                        trace_id, t.simple_id, elapsed,
-                        self.config.qg_fallback_timeout_seconds,
-                    )
-
     # ---- 编排动作 ----
+
+    def _action_finish_review(
+        self,
+        issue_id: str,
+        issue: dict,
+        trace_id: str,
+        *,
+        approved: bool,
+    ):
+        """审查结论已确定 → 根据结论流转状态。
+
+        approved=True  → Done  → 触发 PR merge
+        approved=False → In progress → 重置审查状态，重新创建编码 Session
+        """
+        if self.dry_run:
+            verdict = "APPROVED" if approved else "CHANGES_REQUESTED"
+            logger.info("[%s] [DRY-RUN] 跳过 finish_review (%s)", trace_id, verdict)
+            return
+
+        t = self._trackers[issue_id]
+
+        # 清空审查 Session（无论通过还是打回）
+        t.review_workspace_id = None
+        t.review_branch = None
+
+        if approved:
+            self.rest.update_issue_status(issue_id, "Done", self.config.status_map)
+            t.status = "Done"
+            self._action_count += 1
+            self._save_state()
+            logger.info("[%s] %s: 审查通过 → Done", trace_id, t.simple_id)
+            # 立即触发 PR 合并
+            if self.config.auto_merge:
+                self._action_merge_pr(issue_id, trace_id)
+        else:
+            # CHANGES_REQUESTED：清空编码 Session，重新创建
+            # 1. 在清空 review_branch 前，先从 SQLite 读取审查反馈（供下一轮编码 Agent 参考）
+            if t.review_branch:
+                fb = self.vk_db.get_review_summary(t.review_branch)
+                t.review_feedback = fb or ""
+            # 2. 递增编码轮次（使 _action_start_coding 生成唯一标题，避免幂等检查复用旧 Workspace）
+            t.coding_round = (t.coding_round or 1) + 1
+            # 3. 清空会话状态
+            t.coding_workspace_id = None
+            t.coding_branch = None
+            t.review_workspace_id = None
+            t.review_branch = None
+            self.rest.update_issue_status(issue_id, "In progress", self.config.status_map)
+            t.status = "In progress"
+            self._action_count += 1
+            self._save_state()
+            logger.info(
+                "[%s] %s: 审查打回 → In progress，重启第 %d 轮编码",
+                trace_id,
+                t.simple_id,
+                t.coding_round,
+            )
+            self._action_start_coding(issue_id, issue, trace_id)
+
+    def _ensure_repo_vk_config(self, trace_id: str):
+        """定期检查 VK repo 的 setup/cleanup_script 是否为 NULL，若是则自动补全（E-CFG）。
+
+        幂等操作：只在当前值为 NULL 或空字符串时才写入，不覆盖用户自定义配置。
+        使用 MCP 工具写入，通过 SQLite 直读检查当前值。
+
+        默认配置：
+          setup_script   = "uv sync"
+          cleanup_script = "bash scripts/agent-quality-gate.sh"
+        """
+        repo_id = self.config.repo_id
+        scripts = self.vk_db.get_repo_scripts_by_id(repo_id)
+        if scripts is None:
+            logger.debug("[%s] _ensure_repo_vk_config: repo_id=%s 未找到，跳过", trace_id, repo_id)
+            return
+
+        needs_setup = not (scripts.get("setup_script") or "").strip()
+        needs_cleanup = not (scripts.get("cleanup_script") or "").strip()
+
+        if not needs_setup and not needs_cleanup:
+            logger.debug(
+                "[%s] _ensure_repo_vk_config: repo '%s' 配置已完整，无需更新",
+                trace_id,
+                scripts.get("name"),
+            )
+            return
+
+        logger.info(
+            "[%s] _ensure_repo_vk_config: repo '%s' 配置缺失 (setup=%s, cleanup=%s)，开始补全",
+            trace_id,
+            scripts.get("name"),
+            "NULL" if needs_setup else "OK",
+            "NULL" if needs_cleanup else "OK",
+        )
+
+        if self.dry_run:
+            logger.info("[%s] [DRY-RUN] 跳过 repo 配置补全", trace_id)
+            return
+
+        mcp = VKMCPClient(port=self.config.vk_port)
+        if not mcp.connect():
+            logger.warning("[%s] _ensure_repo_vk_config: MCP 连接失败，跳过本次配置补全", trace_id)
+            return
+        try:
+            if needs_setup:
+                ok = mcp.update_setup_script(repo_id, "uv sync")
+                if ok:
+                    logger.info("[%s] ✓ repo setup_script 已补全: 'uv sync'", trace_id)
+                else:
+                    logger.warning("[%s] repo setup_script 补全失败", trace_id)
+            if needs_cleanup:
+                ok = mcp.update_cleanup_script(repo_id, "bash scripts/agent-quality-gate.sh")
+                if ok:
+                    logger.info(
+                        "[%s] ✓ repo cleanup_script 已补全: 'bash scripts/agent-quality-gate.sh'",
+                        trace_id,
+                    )
+                else:
+                    logger.warning("[%s] repo cleanup_script 补全失败", trace_id)
+        finally:
+            mcp.close()
 
     def _action_start_coding(self, issue_id: str, issue: dict, trace_id: str):
         """动作: 创建编码 Session + 状态 → In progress"""
@@ -447,7 +596,10 @@ class Dispatcher:
         t = self._trackers[issue_id]
         executor = self.config.default_coder_executor
         title = issue.get("title", t.simple_id)
-        prompt = self._build_coding_prompt(issue)
+        # Round 2+ 时在标题中加入轮次号，避免幂等检查误命中上一轮已完成的 Workspace
+        if (t.coding_round or 1) > 1:
+            title = f"{title} [Round {t.coding_round}]"
+        prompt = self._build_coding_prompt(issue, t)
 
         # ---- 幂等检查: 若已存在同名且已 provision 的 workspace，直接复用 ----
         # container_ref=null 表示 VK 创建了记录但从未真正启动 agent（如目录信任检查失败）
@@ -521,119 +673,31 @@ class Dispatcher:
         finally:
             mcp.close()
 
-    # ---- 质量门禁辅助方法 ----
-
-    def _is_coding_done(self, branch: str) -> bool:
-        """检查编码分支是否有新提交（相对于主分支）。"""
-        try:
-            result = subprocess.run(
-                ["git", "-C", self.config.project_dir,
-                 "rev-list", f"{self.config.main_branch}..{branch}", "--count"],
-                capture_output=True, text=True, timeout=10,
-            )
-            count = int(result.stdout.strip()) if result.returncode == 0 else 0
-            return count > 0
-        except Exception:
-            return False
-
-    def _get_branch_head_sha(self, branch: str) -> str | None:
-        """获取分支最新 commit SHA"""
-        try:
-            result = subprocess.run(
-                ["git", "-C", self.config.project_dir, "rev-parse", branch],
-                capture_output=True, text=True, timeout=10,
-            )
-            return result.stdout.strip() if result.returncode == 0 else None
-        except Exception:
-            return None
-
-    def _is_qg_passed(self, sha: str) -> bool:
-        """检查指定 commit 是否已有 QG 通过标记文件"""
-        marker = os.path.join(self.config.project_dir, ".vk", "qg_passed", sha)
-        return os.path.exists(marker)
-
-    def _get_worktree_project_path(self, ws_id: str) -> str | None:
-        """通过 workspace_id 从 VK REST 获取 worktree 内的项目目录路径。"""
-        ws = self.rest.get_workspace_by_id(ws_id)
-        if not ws:
-            return None
-        container_ref = ws.get("container_ref")
-        if not container_ref:
-            return None
-        agent_dir = ws.get("agent_working_dir", "")
-        return os.path.join(container_ref, agent_dir) if agent_dir else container_ref
-
     def _action_finish_coding(self, issue_id: str, issue: dict, trace_id: str):
-        """QG 已通过 -> 更新 Issue 状态为 In review 并立即触发 PR 创建。"""
+        """动作: QG 已通过 → 更新 Issue 状态为 In review，并立即触发 PR 创建。
+
+        只负责状态流转和 PR 创建，确认 QG 已通过（调用方保证）。
+        """
         if self.dry_run:
             logger.info("[%s] [DRY-RUN] 跳过 finish_coding", trace_id)
             return
+
         t = self._trackers[issue_id]
         self.rest.update_issue_status(issue_id, "In review", self.config.status_map)
         t.status = "In review"
         self._action_count += 1
         self._save_state()
-        logger.info("[%s] %s: 编码完成 -> In review", trace_id, t.simple_id)
+        logger.info("[%s] ✓ %s: 编码完成 → In review", trace_id, t.simple_id)
+
+        # 立即触发 PR 创建（不等下一轮轮询减少延迟）
         if self.config.auto_create_pr:
             self._action_create_pr(issue_id, issue, trace_id)
-
-    def _action_run_quality_gate_fallback(
-        self, issue_id: str, issue: dict, trace_id: str
-    ):
-        """兜底动作: Dispatcher 在 worktree 中代为运行质量门禁。
-
-        触发条件: Agent 超时未自行运行 QG（pre-push hook 未触发 / --no-verify）。
-        成功: 写入 SHA 标记文件 -> 流转 In review。
-        失败: 重置计时器（N 分钟后再试），不强制流转（质量是底线）。
-        """
-        if self.dry_run:
-            logger.info("[%s] [DRY-RUN] 跳过兜底 QG", trace_id)
-            return
-
-        t = self._trackers[issue_id]
-        worktree_path = self._get_worktree_project_path(t.coding_workspace_id)
-        if not worktree_path:
-            logger.warning("[%s] %s: 无法获取 worktree 路径，跳过兜底 QG", trace_id, t.simple_id)
-            return
-
-        gate_script = os.path.join(worktree_path, "scripts", "agent-quality-gate.sh")
-        if not os.path.exists(gate_script):
-            logger.warning("[%s] %s: agent-quality-gate.sh 不在 worktree，跳过", trace_id, t.simple_id)
-            return
-
-        logger.info("[%s] %s: Dispatcher 兜底运行 QG (worktree=%s)", trace_id, t.simple_id, worktree_path)
-        try:
-            result = subprocess.run(
-                ["bash", gate_script],
-                cwd=worktree_path,
-                capture_output=True, text=True, timeout=300,
-                env={**os.environ, "VK_SKIP_STATUS_UPDATE": "1"},
-            )
-        except subprocess.TimeoutExpired:
-            logger.warning("[%s] %s: 兜底 QG 超时 (300s)", trace_id, t.simple_id)
-            t.in_progress_since = datetime.now(UTC).isoformat()
-            self._save_state()
-            return
-
-        if result.returncode == 0:
-            sha = self._get_branch_head_sha(t.coding_branch)
-            if sha:
-                marker_dir = os.path.join(self.config.project_dir, ".vk", "qg_passed")
-                os.makedirs(marker_dir, exist_ok=True)
-                open(os.path.join(marker_dir, sha), "w").close()
-                logger.info("[%s] %s: 兜底 QG 通过，标记已写入 (%s)", trace_id, t.simple_id, sha[:8])
-            self._action_finish_coding(issue_id, issue, trace_id)
-        else:
-            tail = (result.stdout + result.stderr)[-600:].strip()
-            logger.warning("[%s] %s: 兜底 QG 失败 (exit=%d)，重置计时器\n%s",
-                           trace_id, t.simple_id, result.returncode, tail)
-            t.in_progress_since = datetime.now(UTC).isoformat()
-            self._save_state()
 
     def _ensure_precommit_hook_installed(self):
         """在主项目 .git/hooks/ 安装 pre-push hook（幂等）。
 
-        主仓库的 hooks 对所有 git worktrees 自动生效。
+        主仓库的 hooks 对所有 git worktrees 自动生效，确保所有 vk/* 分支
+        在 push 前都必须通过质量门禁。
         """
         hook_path = os.path.join(self.config.project_dir, ".git", "hooks", "pre-push")
         hook_source = os.path.join(self.config.project_dir, "scripts", "vk-pre-push-hook.sh")
@@ -642,20 +706,21 @@ class Dispatcher:
             logger.debug("vk-pre-push-hook.sh 不存在，跳过 hook 安装")
             return
 
+        # 幂等：若已是我们的 hook，跳过
         if os.path.exists(hook_path):
             try:
-                existing = open(hook_path).read()
-                if "vk-pre-push-hook.sh" in existing or "VK" in existing:
+                content = open(hook_path).read()
+                if "vk-pre-push-hook.sh" in content or "VK 质量门禁" in content:
                     return
             except Exception:
                 pass
 
         os.makedirs(os.path.dirname(hook_path), exist_ok=True)
+        hook_content = f'#!/usr/bin/env bash\nexec bash "{hook_source}" "$@"\n'
         with open(hook_path, "w") as f:
-            f.write(f'''#!/usr/bin/env bash\nexec bash "{hook_source}" "$@"\n''')
-        import stat as _stat
-        os.chmod(hook_path, os.stat(hook_path).st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
-        logger.info("pre-push hook 已安装: %s -> %s", hook_path, hook_source)
+            f.write(hook_content)
+        os.chmod(hook_path, 0o755)
+        logger.info("✓ pre-push hook 已安装: %s → %s", hook_path, hook_source)
 
     def _action_start_review(self, issue_id: str, issue: dict, trace_id: str):
         """动作: 创建交叉审查 Session，prompt 中注入 PR URL 和 diff 范围"""
@@ -683,24 +748,43 @@ class Dispatcher:
         title = f"Review: {base_branch} ({reviewer})"
 
         # 构建增强 prompt: 基础 prompt + PR 信息 + diff 范围 + 收尾动作
-        prompt = self._build_review_prompt(t, issue_id, trace_id)
+        prompt = self._build_review_prompt(t, trace_id)
 
         # ---- 幂等检查: 若已存在同名且已 provision 的 workspace，直接复用 ----
         # container_ref=null 表示 VK 创建了记录但从未真正启动 agent（如目录信任检查失败）
         existing = self.rest.find_workspace_by_title(title)
         if existing and existing.get("container_ref"):
-            ws_id = existing["id"]
-            branch_name = existing.get("branch")
-            t.review_workspace_id = ws_id
-            t.review_branch = branch_name
-            self._action_count += 1
-            self._save_state()
-            logger.info(
-                "[%s] ✓ 复用已有审查 Workspace: ws=%s",
-                trace_id,
-                ws_id[:8],
-            )
-            return
+            # 若旧 review workspace 已有审查结论，不复用 —— 新建下一轮审查 Workspace
+            # 否则 is_review_done() 会持续读到旧结论，造成 ping-pong 循环
+            existing_branch = existing.get("branch")
+            if existing_branch and self.vk_db.is_review_done(existing_branch) is not None:
+                round_num = 2
+                new_title = f"Review: {base_branch} (round{round_num}) ({reviewer})"
+                while self.rest.find_workspace_by_title(new_title):
+                    round_num += 1
+                    new_title = f"Review: {base_branch} (round{round_num}) ({reviewer})"
+                title = new_title
+                logger.info(
+                    "[%s] 旧审查 Workspace (ws=%s) 已有结论，新建第 %s 轮: %s",
+                    trace_id,
+                    existing["id"][:8],
+                    round_num,
+                    title,
+                )
+                # Fall through to mcp.start_session()
+            else:
+                ws_id = existing["id"]
+                branch_name = existing.get("branch")
+                t.review_workspace_id = ws_id
+                t.review_branch = branch_name
+                self._action_count += 1
+                self._save_state()
+                logger.info(
+                    "[%s] ✓ 复用已有审查 Workspace: ws=%s",
+                    trace_id,
+                    ws_id[:8],
+                )
+                return
         elif existing:
             logger.info(
                 "[%s] 发现未 provision 的同名审查 Workspace (ws=%s container_ref=null)，忽略并重新创建",
@@ -1002,13 +1086,16 @@ class Dispatcher:
 
     # ---- 辅助方法 ----
 
-    def _build_coding_prompt(self, issue: dict) -> str | None:
-        """构建编码 prompt: 工作流规范 + 项目规范 + Issue 完整上下文
+    def _build_coding_prompt(
+        self, issue: dict, tracker: "IssueTracker | None" = None
+    ) -> str | None:
+        """构建编码 prompt: 工作流规范 + 项目规范 + Issue 完整上下文 [+ 审查反馈]
 
         注入顺序（从宏观到具体）:
-        1. coder.md     — 工作流规范和角色职责（通用）
-        2. CLAUDE.md    — 项目编码规范、技术栈、约束（项目级）
-        3. Issue 上下文 — simple_id / title / description（任务级）
+        1. coder.md       — 工作流规范和角色职责（通用）
+        2. CLAUDE.md      — 项目编码规范、技术栈、约束（项目级）
+        3. Issue 上下文   — simple_id / title / description（任务级）
+        4. 审查反馈（可选）— 上一轮 CHANGES_REQUESTED 时审查 Agent 的意见（多轮时）
 
         Agent（Claude Code / Codex 等）收到后会:
         - 根据 Issue 描述理解任务目标
@@ -1041,7 +1128,16 @@ class Dispatcher:
 
         parts.append(issue_section)
 
-        # 4. 强制 QG 步骤（无论 Agent 是否记得，都在 prompt 最后明确要求）
+        # 4. 上一轮审查反馈（CHANGES_REQUESTED 重新编码时注入）
+        if tracker and tracker.review_feedback:
+            round_num = getattr(tracker, "coding_round", 1)
+            parts.append(
+                f"## 上一轮审查反馈（第 {round_num - 1} 轮）\n\n"
+                f"审查 Agent 对上一轮代码的评审意见如下，**请仔细阅读并针对性地修复以下问题**：\n\n"
+                f"{tracker.review_feedback}"
+            )
+
+        # 5. 强制 QG 步骤（无论 Agent 是否记得，都在 prompt 最后明确要求）
         parts.append(
             "## 完成编码后的必要步骤\n\n"
             "代码修改并 commit 后，**必须运行以下命令**：\n\n"
@@ -1051,8 +1147,10 @@ class Dispatcher:
             "该脚本将自动完成：\n"
             "1. 代码 lint 和格式化检查（ruff / eslint）\n"
             "2. 单元测试\n"
-            "3. 通过后调用 `vk-hooks.sh` 推送分支 + 更新 Issue 状态（In review）\n\n"
-            "**不要跳过此步骤** —— 这是工作流状态机的触发器，跳过会导致 Issue 卡在 \"In progress\"。"
+            "3. 通过后推送分支到远端\n\n"
+            "**不要跳过此步骤** —— VK 会在 Agent 退出后以 cleanup_script 再次运行验证，\n"
+            "Dispatcher 通过 SQLite 检测到验证通过后自动流转 Issue 状态。\n"
+            "提前运行可在 Agent 会话内发现并修复问题，避免因 cleanup_script 失败导致流程中断。"
         )
 
         if not parts:
@@ -1060,16 +1158,15 @@ class Dispatcher:
 
         return "\n\n---\n\n".join(parts)
 
-    def _build_review_prompt(
-        self, tracker: IssueTracker, issue_id: str, trace_id: str
-    ) -> str | None:
-        """构建增强审查 prompt: 基础 prompt + PR 信息 + diff 范围 + 收尾动作
+    def _build_review_prompt(self, tracker: IssueTracker, trace_id: str) -> str | None:
+        """构建增强审查 prompt: 基础 prompt + PR 信息 + diff 范围
 
         审查 Agent 需要知道:
         1. PR URL（直接查看）
         2. diff 范围（应该审查哪些文件）
         3. 变更统计（影响范围）
-        4. 审查完成后如何通过 VK REST API 更新 Issue 状态
+
+        注：状态更新由 Dispatcher E45 负责，不在 prompt 中注入 curl 指令。
         """
         # 加载基础 prompt
         base_prompt = self._load_prompt(self.config.review_prompt_file) or ""
@@ -1096,35 +1193,14 @@ class Dispatcher:
                     f"审查命令: `git diff {self.config.main_branch}...{tracker.coding_branch}`\n"
                 )
 
-        # 收尾动作: 审查完成后通过 VK REST 自动更新 Issue 状态
-        # dispatcher 注入 issue_id 和 status_id，避免 agent 自行查找
-        status_done_id = self.config.status_map.get("Done", "")
-        status_inprogress_id = self.config.status_map.get("In progress", "")
-        vk_port = self.config.vk_port
-        action_section = (
-            f"\n## 审查完成后的必要操作\n\n"
-            f"**完成审查报告后，你必须执行以下 curl 命令更新 Issue 状态，这是强制要求：**\n\n"
-            f"### 如果结论是 APPROVED：\n"
-            f"```bash\n"
-            f"curl -s -X PATCH http://localhost:{vk_port}/api/remote/issues/{issue_id} \\\n"
-            f"  -H 'Content-Type: application/json' \\\n"
-            f"  -d '{{\"status_id\": \"{status_done_id}\"}}' && echo '✓ Issue 已标记为 Done'\n"
-            f"```\n\n"
-            f"### 如果结论是 CHANGES_REQUESTED：\n"
-            f"```bash\n"
-            f"curl -s -X PATCH http://localhost:{vk_port}/api/remote/issues/{issue_id} \\\n"
-            f"  -H 'Content-Type: application/json' \\\n"
-            f"  -d '{{\"status_id\": \"{status_inprogress_id}\"}}' && echo '✓ Issue 已退回 In progress'\n"
-            f"```\n\n"
-            f"执行命令后确认 echo 输出成功即可，无需其他操作。\n"
-        )
+        # 注意：审查完成后的 Issue 状态更新由 Dispatcher E45 负责（读 SQLite summary 检测结论），
+        # 不再要求 reviewer agent 执行 curl PATCH，避免 agent 越权触发额外编码 session。
 
         if not pr_section and not diff_section:
-            base_only = (base_prompt + action_section) if base_prompt else None
-            return base_only[:5000] if base_only else None
+            return base_prompt[:5000] if base_prompt else None
 
-        enhanced = base_prompt + pr_section + diff_section + action_section
-        return enhanced[:5000]  # 限制总长度（放宽到 5000 以容纳 action_section）
+        enhanced = base_prompt + pr_section + diff_section
+        return enhanced[:5000]
 
     def _pull_main(self, trace_id: str):
         """合并后拉取最新主分支到本地"""

@@ -83,15 +83,14 @@ class VKRestClient:
         return matches[0] if matches else None
 
     def get_workspace_by_id(self, ws_id: str) -> dict | None:
-        """\u6309 ID \u83b7\u53d6 workspace \u8be6\u60c5\uff08\u542b container_ref / agent_working_dir\uff09"""
+        """按 ID 获取 workspace 详情（含 container_ref / agent_working_dir）"""
         try:
-            resp = urllib.request.urlopen(
-                f"{self.base_url}/api/task-attempts/{ws_id}", timeout=10
-            )
+            resp = urllib.request.urlopen(f"{self.base_url}/api/task-attempts/{ws_id}", timeout=10)
             envelope: dict = json.loads(resp.read().decode())
+            # 响应结构: {success, data: {...}} 或直接返回对象
             return envelope.get("data") or envelope
         except Exception as e:
-            logger.warning("get_workspace_by_id(%s) failed: %s", ws_id, e)
+            logger.warning("get_workspace_by_id 失败 (%s): %s", ws_id[:8], e)
             return None
 
     def archive_workspace(self, workspace_id: str) -> bool:
@@ -392,6 +391,47 @@ class VKMCPClient:
             logger.info("已删除探针 Issue: %s", issue_id[:8])
 
         return mapping
+
+    # ---- Repo 配置管理 ----
+
+    def list_repos(self) -> list[dict]:
+        """列出所有 Repo 配置
+
+        Returns:
+            Repo 字典列表，每个包含 id, name, setup_script, cleanup_script 等字段
+        """
+        result = self._call_tool("list_repos", {})
+        if result and isinstance(result, dict):
+            return result.get("repos", [])
+        return []
+
+    def update_setup_script(self, repo_id: str, script: str) -> bool:
+        """更新 Repo 的 setup_script（环境初始化命令，如 uv sync）
+
+        幂等操作：调用方应在 script 为 NULL 时才调用，避免覆盖用户配置。
+
+        Returns:
+            True = 更新成功，False = 更新失败
+        """
+        result = self._call_tool(
+            "update_setup_script",
+            {"repo_id": repo_id, "script": script},
+        )
+        return result is not None
+
+    def update_cleanup_script(self, repo_id: str, script: str) -> bool:
+        """更新 Repo 的 cleanup_script（质量门禁命令）
+
+        幂等操作：调用方应在 script 为 NULL 时才调用，避免覆盖用户配置。
+
+        Returns:
+            True = 更新成功，False = 更新失败
+        """
+        result = self._call_tool(
+            "update_cleanup_script",
+            {"repo_id": repo_id, "script": script},
+        )
+        return result is not None
 
     # ---- 内部方法 ----
 

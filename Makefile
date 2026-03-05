@@ -45,3 +45,16 @@ dispatcher-once:
 dispatcher-status:
 	@echo "调度器状态..."
 	VK_PORT=$(VK_PORT) python -m dispatcher --project-dir . status --cached
+
+# ── 守护启动（VK + Dispatcher 一键管理）──────────────────────────────────────
+maw-up: ## 一键启动 VK + Dispatcher（守护模式）
+	@bash .vk/dev.sh
+
+maw-down:
+	@echo "停止 VK 和 Dispatcher..."
+	@pkill -f "vibe-kanban" 2>/dev/null || true
+	@pkill -f "python.*dispatcher" 2>/dev/null || true
+	@echo "已停止"
+
+maw-logs:
+	@tail -f .vk/logs/vk.log .vk/logs/dispatcher.log 2>/dev/null || echo "日志文件不存在，请先运行 make maw-up"
