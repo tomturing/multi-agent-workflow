@@ -313,8 +313,41 @@ open('CLAUDE.md', 'w').write(content)
         log_ok "生成 CLAUDE.md"
     fi
 
-    # ---- Step 5: 创建 AGENTS.md 符号链接 ----
-    log_header "Step 5: AGENTS.md 符号链接"
+    # ---- Step 5: 注入 Dispatcher 健康检查到 CLAUDE.md ----
+    log_header "Step 5: Dispatcher 健康检查"
+
+    # 检查 CLAUDE.md 中是否已有健康检查标记
+    if [ -f "CLAUDE.md" ] && grep -q "Dispatcher 健康检查" "CLAUDE.md" 2>/dev/null; then
+        log_skip "CLAUDE.md 中已包含 Dispatcher 健康检查"
+    else
+        # 获取绝对路径（兼容无 realpath 命令的系统）
+        if command -v realpath &>/dev/null; then
+            ABS_PROJECT_DIR="$(realpath "$PROJECT_DIR")"
+            ABS_DISPATCHER_DIR="$(realpath "$SCRIPT_DIR")"
+        else
+            # fallback: 使用 python3 获取绝对路径
+            ABS_PROJECT_DIR="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$PROJECT_DIR")"
+            ABS_DISPATCHER_DIR="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$SCRIPT_DIR")"
+        fi
+
+        # 使用 python3 进行安全的模板渲染（避免 sed 特殊字符问题）
+        python3 -c "
+import sys
+content = open('${TEMPLATE_DIR}/claude_dispatcher_check.md').read()
+replacements = {
+    '{{PROJECT_DIR}}': '''${ABS_PROJECT_DIR}''',
+    '{{DISPATCHER_DIR}}': '''${ABS_DISPATCHER_DIR}''',
+    '{{PROJECT_NAME}}': '''${PROJECT_NAME}''',
+}
+for k, v in replacements.items():
+    content = content.replace(k, v)
+open('CLAUDE.md', 'a').write('\n' + content)
+"
+        log_ok "追加 Dispatcher 健康检查到 CLAUDE.md"
+    fi
+
+    # ---- Step 6: 创建 AGENTS.md 符号链接 ----
+    log_header "Step 6: AGENTS.md 符号链接"
 
     if [ -f "AGENTS.md" ] || [ -L "AGENTS.md" ]; then
         log_skip "AGENTS.md"
@@ -323,8 +356,8 @@ open('CLAUDE.md', 'w').write(content)
         log_ok "创建 AGENTS.md → CLAUDE.md"
     fi
 
-    # ---- Step 6: 创建 CLAUDE.local.md ----
-    log_header "Step 6: CLAUDE.local.md（本地配置）"
+    # ---- Step 7: 创建 CLAUDE.local.md ----
+    log_header "Step 7: CLAUDE.local.md（本地配置）"
 
     if [ -f "CLAUDE.local.md" ]; then
         log_skip "CLAUDE.local.md"
@@ -354,18 +387,18 @@ LOCALEOF
         log_ok "创建 CLAUDE.local.md"
     fi
 
-    # ---- Step 7: 更新 .gitignore ----
-    log_header "Step 7: .gitignore"
+    # ---- Step 8: 更新 .gitignore ----
+    log_header "Step 8: .gitignore"
 
     safe_append "${TEMPLATE_DIR}/gitignore.append" ".gitignore" "CLAUDE.local.md"
 
-    # ---- Step 8: 更新 Makefile ----
-    log_header "Step 8: Makefile"
+    # ---- Step 9: 更新 Makefile ----
+    log_header "Step 9: Makefile"
 
     safe_append "${TEMPLATE_DIR}/Makefile.append" "Makefile" "multi-agent-workflow" "quality-gate"
 
-    # ---- Step 9: 创建 .vscode/mcp.json（VS Code MCP 配置）----
-    log_header "Step 9: VS Code MCP 配置"
+    # ---- Step 10: 创建 .vscode/mcp.json（VS Code MCP 配置）----
+    log_header "Step 10: VS Code MCP 配置"
 
     # 在目标项目目录创建 .vscode/mcp.json
     mkdir -p .vscode
