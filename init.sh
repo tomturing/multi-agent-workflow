@@ -272,6 +272,55 @@ main() {
     # .vk/dispatcher.json 配置模板
     safe_copy "${TEMPLATE_DIR}/vk/dispatcher.json" ".vk/dispatcher.json"
 
+    # ---- Step 3.5: pyproject.toml 自动生成 ----
+    # 如果检测到 Python 项目但无 pyproject.toml，生成最小配置
+    log_header "Step 3.5: Python 项目配置检测"
+    local IS_PYTHON_PROJECT=false
+    if [ -f "pyproject.toml" ] || [ -f "setup.py" ] || [ -f "setup.cfg" ]; then
+        IS_PYTHON_PROJECT=true
+    elif find . -maxdepth 2 -name "*.py" \
+             -not -path "./.git/*" -not -path "*/.venv/*" \
+             -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
+        IS_PYTHON_PROJECT=true
+    fi
+
+    if $IS_PYTHON_PROJECT && [ ! -f "pyproject.toml" ]; then
+        log_info "检测到 Python 项目但无 pyproject.toml，生成最小配置..."
+        cat > pyproject.toml << 'PYPROJECTEOF'
+# 自动生成的 pyproject.toml（由 init.sh 创建）
+# 请根据项目需求修改以下配置
+
+[project]
+name = "TODO-project-name"
+version = "0.1.0"
+description = "TODO: 项目描述"
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8.0",
+    "pytest>=8.0.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+PYPROJECTEOF
+        log_ok "生成 pyproject.toml（包含 ruff + pytest dev 依赖）"
+        log_info "请运行 'uv sync --dev' 安装开发依赖"
+    elif $IS_PYTHON_PROJECT; then
+        log_skip "pyproject.toml（已存在）"
+    else
+        log_info "未检测到 Python 项目，跳过 pyproject.toml 生成"
+    fi
+
     # ---- Step 4: 生成 CLAUDE.md ----
     log_header "Step 4: 生成 CLAUDE.md"
 

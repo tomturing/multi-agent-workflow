@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Agent 质量门禁脚本 — 自动探测版
+# Agent 质量门禁脚本 — 自动探测版 v2
 #
 # 用途: VK Workspace Cleanup Script 自动触发，或手动运行 make quality-gate
 # 功能: 自动探测项目结构，零配置适配任意项目
 #
 # 探测逻辑优先级:
 #   Python: pyproject.toml > setup.py > *.py 文件存在
+#   Node.js: package.json 有 test/lint script
+#   Go: go.mod 存在
+#   Rust: Cargo.toml 存在
 #   源码目录: src/ dispatcher/ backend/ app/ lib/ + 含 __init__.py 的子目录
-#   测试目录: tests/ test/ + 任意子服务的 tests/
+#   测试目录: tests/ test/ src/tests/ + **/test_*.py 文件
 #   前端: frontend/*/package.json + node_modules/.pnpm/（非空安装标记）
 # ============================================================================
 
@@ -62,11 +65,17 @@ log_skip() { echo -e "  ${YELLOW}⊘ SKIP${NC}: $1"; SKIP=$((SKIP + 1)); }
 # ============================================================================
 
 IS_PYTHON=false
+IS_NODEJS=false
+IS_GO=false
+IS_RUST=false
 IS_FRONTEND=false
 PYTHON_RUNNER=""
 PYTHON_SRC_DIRS=()
 PYTHON_TEST_DIRS=()
 FRONTEND_DIRS=()
+NODEJS_DIRS=()
+GO_DIRS=()
+RUST_DIRS=()
 
 detect_project_structure() {
     log_header "项目结构自动探测"
@@ -109,17 +118,33 @@ detect_project_structure() {
 
         readarray -t PYTHON_SRC_DIRS < <(printf '%s\n' "${PYTHON_SRC_DIRS[@]}" | sort -u)
 
-        # 发现测试目录
+        # 发现测试目录：支持多种布局
+        # 1. 顶层 tests/ 或 test/
         for d in tests test; do
             [ -d "$d" ] && PYTHON_TEST_DIRS+=("$d")
         done
+        # 2. src/tests/ 布局
+        if [ -d "src/tests" ]; then
+            PYTHON_TEST_DIRS+=("src/tests")
+        fi
+        # 3. 子服务的 tests/（如 backend/tests/）
         while IFS= read -r tdir; do
             local rel="${tdir#./}"
-            [[ "$rel" == "tests" || "$rel" == "test" ]] && continue
+            [[ "$rel" == "tests" || "$rel" == "test" || "$rel" == "src/tests" ]] && continue
             PYTHON_TEST_DIRS+=("$rel")
         done < <(find . -maxdepth 3 -type d -name "tests" \
                      -not -path "./.git/*" -not -path "*/.venv/*" \
                      2>/dev/null | grep -v '^\./tests$' | head -20)
+        # 4. 无 tests/ 目录但有 test_*.py 文件
+        if [ ${#PYTHON_TEST_DIRS[@]} -eq 0 ]; then
+            local test_files; test_files=$(find . -maxdepth 3 -name "test_*.py" \
+                -not -path "./.git/*" -not -path "*/.venv/*" \
+                -not -path "*/node_modules/*" 2>/dev/null | head -5)
+            if [ -n "$test_files" ]; then
+                # 标记为"散落测试文件"模式
+                PYTHON_TEST_DIRS+=("SCATTERED")
+            fi
+        fi
 
         readarray -t PYTHON_TEST_DIRS < <(printf '%s\n' "${PYTHON_TEST_DIRS[@]}" | sort -u)
 
@@ -130,7 +155,74 @@ detect_project_structure() {
         log_info "Python 项目: 未检测到"
     fi
 
-    # ---- 前端项目检测 ----
+    # ---- Node.js 项目检测 ----
+    # 根目录 package.json
+    if [ -f "package.json" ]; then
+        IS_NODEJS=true
+        NODEJS_DIRS+=(".")
+    fi
+    # 子目录 package.json（如 packages/、apps/）
+    while IFS= read -r pkg; do
+        local dir="${pkg%/package.json}"
+        dir="${dir#./}"
+        [[ -z "$dir" ]] && continue
+        NODEJS_DIRS+=("$dir")
+    done < <(find . -maxdepth 3 -name "package.json" \
+                 -not -path "./.git/*" -not -path "*/node_modules/*" 2>/dev/null | head -20)
+
+    readarray -t NODEJS_DIRS < <(printf '%s\n' "${NODEJS_DIRS[@]}" | sort -u)
+
+    if $IS_NODEJS; then
+        log_info "Node.js: ✓  目录=${NODEJS_DIRS[*]}"
+    else
+        log_info "Node.js 项目: 未检测到"
+    fi
+
+    # ---- Go 项目检测 ----
+    if [ -f "go.mod" ]; then
+        IS_GO=true
+        GO_DIRS+=(".")
+    fi
+    # 多模块项目（go.work 或子目录 go.mod）
+    while IFS= read -r gomod; do
+        local dir="${gomod%/go.mod}"
+        dir="${dir#./}"
+        [[ -z "$dir" ]] && continue
+        GO_DIRS+=("$dir")
+    done < <(find . -maxdepth 3 -name "go.mod" \
+                 -not -path "./.git/*" 2>/dev/null | grep -v '^\./go.mod$' | head -20)
+
+    readarray -t GO_DIRS < <(printf '%s\n' "${GO_DIRS[@]}" | sort -u)
+
+    if $IS_GO; then
+        log_info "Go: ✓  目录=${GO_DIRS[*]}"
+    else
+        log_info "Go 项目: 未检测到"
+    fi
+
+    # ---- Rust 项目检测 ----
+    if [ -f "Cargo.toml" ]; then
+        IS_RUST=true
+        RUST_DIRS+=(".")
+    fi
+    # workspace 成员
+    while IFS= read -r cargo; do
+        local dir="${cargo%/Cargo.toml}"
+        dir="${dir#./}"
+        [[ -z "$dir" ]] && continue
+        RUST_DIRS+=("$dir")
+    done < <(find . -maxdepth 3 -name "Cargo.toml" \
+                 -not -path "./.git/*" 2>/dev/null | grep -v '^\./Cargo.toml$' | head -20)
+
+    readarray -t RUST_DIRS < <(printf '%s\n' "${RUST_DIRS[@]}" | sort -u)
+
+    if $IS_RUST; then
+        log_info "Rust: ✓  目录=${RUST_DIRS[*]}"
+    else
+        log_info "Rust 项目: 未检测到"
+    fi
+
+    # ---- 前端项目检测（兼容旧逻辑）----
     for app_dir in frontend/customer frontend/admin; do
         if [ -f "${app_dir}/package.json" ] && [ -d "${app_dir}/node_modules/.pnpm" ]; then
             IS_FRONTEND=true
@@ -154,6 +246,9 @@ detect_project_structure() {
 # ============================================================================
 
 HAS_PYTHON_CHANGES=false
+HAS_NODEJS_CHANGES=false
+HAS_GO_CHANGES=false
+HAS_RUST_CHANGES=false
 HAS_FRONTEND_CHANGES=false
 
 detect_changes() {
@@ -175,8 +270,11 @@ detect_changes() {
     while IFS= read -r f; do
         [[ -z "$f" ]] && continue
         [[ "$f" == *.py ]] && HAS_PYTHON_CHANGES=true
-        [[ "$f" == frontend/* || "$f" == *.ts || "$f" == *.vue || "$f" == *.tsx ]] \
-            && HAS_FRONTEND_CHANGES=true
+        [[ "$f" == *.js || "$f" == *.ts || "$f" == *.jsx || "$f" == *.tsx || "$f" == package.json ]] \
+            && HAS_NODEJS_CHANGES=true
+        [[ "$f" == *.go || "$f" == go.mod || "$f" == go.sum ]] && HAS_GO_CHANGES=true
+        [[ "$f" == *.rs || "$f" == Cargo.toml || "$f" == Cargo.lock ]] && HAS_RUST_CHANGES=true
+        [[ "$f" == frontend/* || "$f" == *.vue ]] && HAS_FRONTEND_CHANGES=true
     done <<< "$changed"
 }
 
@@ -195,10 +293,18 @@ _ruff_cmd() {
     fi
 }
 
+# 检查 Python dev 依赖是否已安装（已弃用， 内联到 check_python_lint/format 中)
+
 check_python_lint() {
     log_header "Python 静态检查 (ruff check)"
     local cmd; cmd="$(_ruff_cmd)"
-    if [ -z "$cmd" ]; then log_skip "ruff 未安装"; return; fi
+    if [ -z "$cmd" ]; then
+        log_skip "ruff 未安装"
+        if [ -f "pyproject.toml" ] && command -v uv &>/dev/null; then
+            echo -e "  ${YELLOW}  提示: 运行 'uv sync --dev' 安装开发依赖${NC}"
+        fi
+        return
+    fi
     if [ ${#PYTHON_SRC_DIRS[@]} -eq 0 ]; then log_skip "未发现源码目录"; return; fi
 
     if $cmd check "${PYTHON_SRC_DIRS[@]}" 2>/dev/null; then
@@ -211,7 +317,13 @@ check_python_lint() {
 check_python_format() {
     log_header "Python 格式检查 (ruff format)"
     local cmd; cmd="$(_ruff_cmd)"
-    if [ -z "$cmd" ]; then log_skip "ruff 未安装"; return; fi
+    if [ -z "$cmd" ]; then
+        log_skip "ruff 未安装"
+        if [ -f "pyproject.toml" ] && command -v uv &>/dev/null; then
+            echo -e "  ${YELLOW}  提示: 运行 'uv sync --dev' 安装开发依赖${NC}"
+        fi
+        return
+    fi
     if [ ${#PYTHON_SRC_DIRS[@]} -eq 0 ]; then log_skip "未发现源码目录"; return; fi
 
     if $cmd format --check "${PYTHON_SRC_DIRS[@]}" 2>/dev/null; then
@@ -224,7 +336,7 @@ check_python_format() {
 check_python_test() {
     log_header "Python 单元测试 (pytest)"
     if [ ${#PYTHON_TEST_DIRS[@]} -eq 0 ]; then
-        log_skip "未发现测试目录 (tests/ / test/)"; return
+        log_skip "未发现测试目录 (tests/ / test/ / src/tests/)"; return
     fi
 
     local pytest_cmd
@@ -233,12 +345,28 @@ check_python_test() {
     elif command -v pytest &>/dev/null; then
         pytest_cmd="pytest"
     else
-        log_skip "pytest 未安装"; return
+        log_skip "pytest 未安装"
+        if [ -f "pyproject.toml" ] && command -v uv &>/dev/null; then
+            echo -e "  ${YELLOW}  提示: 运行 'uv sync --dev' 安装开发依赖${NC}"
+        fi
+        return
     fi
 
     local all_pass=true
     for tdir in "${PYTHON_TEST_DIRS[@]}"; do
         [[ -z "$tdir" ]] && continue   # 过滤空元素（readarray 可能产生）
+        # SCATTERED 模式：无 tests/ 目录但有散落的 test_*.py 文件
+        if [ "$tdir" == "SCATTERED" ]; then
+            local ec=0
+            $pytest_cmd --ignore=.venv --ignore=node_modules -q --tb=short 2>/dev/null || ec=$?
+            if [ $ec -eq 0 ] || [ $ec -eq 5 ]; then
+                log_pass "散落测试文件 — 通过（或无测试）"
+            else
+                log_fail "散落测试文件 — 部分失败 (exit=$ec)"
+                all_pass=false
+            fi
+            continue
+        fi
         local ignore_flags=()
         [ -d "${tdir}/integration" ] && ignore_flags+=("--ignore=${tdir}/integration")
         # exit code 5 = no tests collected，不算失败
@@ -252,6 +380,223 @@ check_python_test() {
         fi
     done
     $all_pass && log_pass "Python 测试全部通过"
+}
+
+# ============================================================================
+# Node.js 检查
+# ============================================================================
+
+check_nodejs_test() {
+    log_header "Node.js 单元测试"
+    if [ ${#NODEJS_DIRS[@]} -eq 0 ]; then
+        log_skip "未发现 Node.js 项目"; return
+    fi
+
+    local all_pass=true
+    for dir in "${NODEJS_DIRS[@]}"; do
+        [[ -z "$dir" ]] && continue
+        local pkg="${dir}/package.json"
+        [ "$dir" = "." ] && pkg="package.json"
+        if [ ! -f "$pkg" ]; then continue; fi
+
+        # 检查是否有 test 脚本
+        if ! grep -q '"test"' "$pkg" 2>/dev/null; then
+            log_skip "${dir} — 未定义 test 脚本"; continue
+        fi
+
+        # 检查依赖是否安装
+        local node_modules="${dir}/node_modules"
+        [ "$dir" = "." ] && node_modules="node_modules"
+        if [ ! -d "$node_modules" ]; then
+            log_skip "${dir} — 依赖未安装 (运行 pnpm install)"; continue
+        fi
+
+        local test_cmd="pnpm test"
+        command -v pnpm &>/dev/null || test_cmd="npm test"
+
+        local ec=0
+        (cd "$dir" && $test_cmd 2>/dev/null) || ec=$?
+        if [ $ec -eq 0 ]; then
+            log_pass "${dir} test — 通过"
+        else
+            log_fail "${dir} test — 失败 (exit=$ec)"
+            all_pass=false
+        fi
+    done
+    $all_pass && log_pass "Node.js 测试全部通过"
+}
+
+check_nodejs_lint() {
+    log_header "Node.js Lint 检查"
+    if [ ${#NODEJS_DIRS[@]} -eq 0 ]; then
+        log_skip "未发现 Node.js 项目"; return
+    fi
+
+    local all_pass=true
+    for dir in "${NODEJS_DIRS[@]}"; do
+        [[ -z "$dir" ]] && continue
+        local pkg="${dir}/package.json"
+        [ "$dir" = "." ] && pkg="package.json"
+        if [ ! -f "$pkg" ]; then continue; fi
+
+        # 检查是否有 lint 脚本
+        if ! grep -q '"lint"' "$pkg" 2>/dev/null; then
+            log_skip "${dir} — 未定义 lint 脚本"; continue
+        fi
+
+        # 检查依赖是否安装
+        local node_modules="${dir}/node_modules"
+        [ "$dir" = "." ] && node_modules="node_modules"
+        if [ ! -d "$node_modules" ]; then
+            log_skip "${dir} — 依赖未安装 (运行 pnpm install)"; continue
+        fi
+
+        local lint_cmd="pnpm lint"
+        command -v pnpm &>/dev/null || lint_cmd="npm run lint"
+
+        local ec=0
+        (cd "$dir" && $lint_cmd 2>/dev/null) || ec=$?
+        if [ $ec -eq 0 ]; then
+            log_pass "${dir} lint — 通过"
+        else
+            log_fail "${dir} lint — 失败 (exit=$ec)"
+            all_pass=false
+        fi
+    done
+    $all_pass && log_pass "Node.js lint 全部通过"
+}
+
+# ============================================================================
+# Go 检查
+# ============================================================================
+
+check_go_test() {
+    log_header "Go 单元测试"
+    if ! $IS_GO; then
+        log_skip "未发现 Go 项目"; return
+    fi
+    if ! command -v go &>/dev/null; then
+        log_skip "go 命令未安装"; return
+    fi
+
+    local ec=0
+    go test ./... 2>/dev/null || ec=$?
+    if [ $ec -eq 0 ]; then
+        log_pass "go test — 通过"
+    else
+        log_fail "go test — 失败 (exit=$ec)"
+    fi
+}
+
+check_go_lint() {
+    log_header "Go Lint 检查"
+    if ! $IS_GO; then
+        log_skip "未发现 Go 项目"; return
+    fi
+
+    # 优先使用 golangci-lint
+    if command -v golangci-lint &>/dev/null; then
+        local ec=0
+        golangci-lint run 2>/dev/null || ec=$?
+        if [ $ec -eq 0 ]; then
+            log_pass "golangci-lint — 通过"
+        else
+            log_fail "golangci-lint — 失败 (exit=$ec)"
+        fi
+    elif command -v go &>/dev/null; then
+        # 回退到 go vet
+        local ec=0
+        go vet ./... 2>/dev/null || ec=$?
+        if [ $ec -eq 0 ]; then
+            log_pass "go vet — 通过"
+        else
+            log_fail "go vet — 失败 (exit=$ec)"
+        fi
+    else
+        log_skip "Go lint 工具未安装 (golangci-lint 或 go vet)"
+    fi
+}
+
+check_go_format() {
+    log_header "Go 格式检查"
+    if ! $IS_GO; then
+        log_skip "未发现 Go 项目"; return
+    fi
+    if ! command -v gofmt &>/dev/null && ! command -v go &>/dev/null; then
+        log_skip "gofmt 未安装"; return
+    fi
+
+    # 检查是否有需要格式化的文件
+    local unformatted
+    unformatted=$(gofmt -l . 2>/dev/null | head -20)
+    if [ -z "$unformatted" ]; then
+        log_pass "gofmt — 格式一致"
+    else
+        log_fail "gofmt — 以下文件需要格式化:\n${unformatted}"
+    fi
+}
+
+# ============================================================================
+# Rust 检查
+# ============================================================================
+
+check_rust_test() {
+    log_header "Rust 单元测试"
+    if ! $IS_RUST; then
+        log_skip "未发现 Rust 项目"; return
+    fi
+    if ! command -v cargo &>/dev/null; then
+        log_skip "cargo 命令未安装"; return
+    fi
+
+    local ec=0
+    cargo test 2>/dev/null || ec=$?
+    if [ $ec -eq 0 ]; then
+        log_pass "cargo test — 通过"
+    else
+        log_fail "cargo test — 失败 (exit=$ec)"
+    fi
+}
+
+check_rust_lint() {
+    log_header "Rust Lint 检查"
+    if ! $IS_RUST; then
+        log_skip "未发现 Rust 项目"; return
+    fi
+    if ! command -v cargo &>/dev/null; then
+        log_skip "cargo 命令未安装"; return
+    fi
+
+    # cargo clippy 是 Rust 的首选 lint 工具
+    if command -v cargo-clippy &>/dev/null || cargo clippy --version &>/dev/null 2>&1; then
+        local ec=0
+        cargo clippy 2>/dev/null || ec=$?
+        if [ $ec -eq 0 ]; then
+            log_pass "cargo clippy — 通过"
+        else
+            log_fail "cargo clippy — 失败 (exit=$ec)"
+        fi
+    else
+        log_skip "cargo clippy 未安装 (运行 'rustup component add clippy')"
+    fi
+}
+
+check_rust_format() {
+    log_header "Rust 格式检查"
+    if ! $IS_RUST; then
+        log_skip "未发现 Rust 项目"; return
+    fi
+    if ! command -v cargo &>/dev/null; then
+        log_skip "cargo 命令未安装"; return
+    fi
+
+    local ec=0
+    cargo fmt --check 2>/dev/null || ec=$?
+    if [ $ec -eq 0 ]; then
+        log_pass "cargo fmt — 格式一致"
+    else
+        log_fail "cargo fmt — 不一致 (运行 'cargo fmt' 修复)"
+    fi
 }
 
 # ============================================================================
@@ -296,22 +641,38 @@ main() {
     detect_project_structure
     detect_changes
 
-    echo -e "\n  变更检测: Python=$([ "$HAS_PYTHON_CHANGES" = true ] && echo 是 || echo 否)  前端=$([ "$HAS_FRONTEND_CHANGES" = true ] && echo 是 || echo 否)"
+    echo -e "\n  变更检测: Python=$([ "$HAS_PYTHON_CHANGES" = true ] && echo 是 || echo 否)  Node.js=$([ "$HAS_NODEJS_CHANGES" = true ] && echo 是 || echo 否)  Go=$([ "$HAS_GO_CHANGES" = true ] && echo 是 || echo 否)  Rust=$([ "$HAS_RUST_CHANGES" = true ] && echo 是 || echo 否)  前端=$([ "$HAS_FRONTEND_CHANGES" = true ] && echo 是 || echo 否)"
 
     # 决定检查范围
     local run_python=$IS_PYTHON
+    local run_nodejs=$IS_NODEJS
+    local run_go=$IS_GO
+    local run_rust=$IS_RUST
     local run_frontend=$IS_FRONTEND
 
-    if [ "$HAS_PYTHON_CHANGES" = false ] && [ "$HAS_FRONTEND_CHANGES" = false ]; then
+    # 如果没有任何变更，运行所有探测到的检查
+    if [ "$HAS_PYTHON_CHANGES" = false ] && [ "$HAS_NODEJS_CHANGES" = false ] \
+       && [ "$HAS_GO_CHANGES" = false ] && [ "$HAS_RUST_CHANGES" = false ] \
+       && [ "$HAS_FRONTEND_CHANGES" = false ]; then
         echo -e "\n  ${YELLOW}未检测到变更，基于探测结构运行全部适用检查${NC}"
     else
+        # 只运行有变更的语言检查
         $IS_PYTHON && ! $HAS_PYTHON_CHANGES && run_python=false
+        $IS_NODEJS && ! $HAS_NODEJS_CHANGES && run_nodejs=false
+        $IS_GO && ! $HAS_GO_CHANGES && run_go=false
+        $IS_RUST && ! $HAS_RUST_CHANGES && run_rust=false
         $IS_FRONTEND && ! $HAS_FRONTEND_CHANGES && run_frontend=false
     fi
 
+    # 执行检查
     $run_python && { check_python_lint; check_python_format; check_python_test; }
+    $run_nodejs && { check_nodejs_lint; check_nodejs_test; }
+    $run_go && { check_go_lint; check_go_format; check_go_test; }
+    $run_rust && { check_rust_lint; check_rust_format; check_rust_test; }
     $run_frontend && check_frontend_lint
-    ! $run_python && ! $run_frontend && log_skip "未检测到需要检查的项目类型"
+
+    ! $run_python && ! $run_nodejs && ! $run_go && ! $run_rust && ! $run_frontend && \
+        log_skip "未检测到需要检查的项目类型"
 
     # ---- 汇总 ----
     log_header "质量门禁汇总"
@@ -321,6 +682,9 @@ main() {
         echo "质量门禁报告 — $(date '+%Y-%m-%d %H:%M:%S')"
         echo "分支: $(git branch --show-current 2>/dev/null || echo 'unknown')"
         echo "Python 源码: ${PYTHON_SRC_DIRS[*]:-无}  测试: ${PYTHON_TEST_DIRS[*]:-无}"
+        echo "Node.js: ${NODEJS_DIRS[*]:-无}"
+        echo "Go: ${GO_DIRS[*]:-无}"
+        echo "Rust: ${RUST_DIRS[*]:-无}"
         echo "前端: ${FRONTEND_DIRS[*]:-无}"
         echo "通过: ${PASS}, 失败: ${FAIL}, 跳过: ${SKIP}"
         echo "结果: $([ $FAIL -eq 0 ] && echo 'PASSED' || echo 'FAILED')"
