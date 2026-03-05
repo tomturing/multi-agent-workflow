@@ -269,12 +269,12 @@ detect_changes() {
 
     while IFS= read -r f; do
         [[ -z "$f" ]] && continue
-        [[ "$f" == *.py ]] && HAS_PYTHON_CHANGES=true
+        [[ "$f" == *.py ]] && HAS_PYTHON_CHANGES=true || true
         [[ "$f" == *.js || "$f" == *.ts || "$f" == *.jsx || "$f" == *.tsx || "$f" == package.json ]] \
-            && HAS_NODEJS_CHANGES=true
-        [[ "$f" == *.go || "$f" == go.mod || "$f" == go.sum ]] && HAS_GO_CHANGES=true
-        [[ "$f" == *.rs || "$f" == Cargo.toml || "$f" == Cargo.lock ]] && HAS_RUST_CHANGES=true
-        [[ "$f" == frontend/* || "$f" == *.vue ]] && HAS_FRONTEND_CHANGES=true
+            && HAS_NODEJS_CHANGES=true || true
+        [[ "$f" == *.go || "$f" == go.mod || "$f" == go.sum ]] && HAS_GO_CHANGES=true || true
+        [[ "$f" == *.rs || "$f" == Cargo.toml || "$f" == Cargo.lock ]] && HAS_RUST_CHANGES=true || true
+        [[ "$f" == frontend/* || "$f" == *.vue ]] && HAS_FRONTEND_CHANGES=true || true
     done <<< "$changed"
 }
 
