@@ -140,8 +140,8 @@ echo "   按 Ctrl+C 或 make dev-down 停止"
 echo ""
 
 # ── 4. 守护：等待 Dispatcher 退出，区分崩溃 vs 用户主动停止 ──────────────────
-wait "${DISPATCHER_PID}" 2>/dev/null || true
-DISPATCHER_EXIT=$?
+DISPATCHER_EXIT=0
+wait "${DISPATCHER_PID}" 2>/dev/null || DISPATCHER_EXIT=$?
 
 # 若是用户 Ctrl+C 触发的 cleanup，STOPPING=true，不报异常
 if [[ "${STOPPING}" == false ]]; then
