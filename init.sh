@@ -272,6 +272,81 @@ main() {
     # .vk/dispatcher.json 配置模板
     safe_copy "${TEMPLATE_DIR}/vk/dispatcher.json" ".vk/dispatcher.json"
 
+    # ---- Step 3.5: Python 项目自动生成 pyproject.toml ----
+    log_header "Step 3.5: Python 项目配置检测"
+
+    # 检测是否为 Python 项目
+    local IS_PYTHON=false
+    if [ -f "pyproject.toml" ] || [ -f "setup.py" ] || [ -f "setup.cfg" ]; then
+        IS_PYTHON=true
+    elif find . -maxdepth 2 -name "*.py" \
+             -not -path "./.git/*" -not -path "*/.venv/*" \
+             -not -path "*/node_modules/*" 2>/dev/null | grep -q .; then
+        IS_PYTHON=true
+    fi
+
+    if $IS_PYTHON; then
+        if [ -f "pyproject.toml" ]; then
+            log_skip "pyproject.toml（已存在）"
+        else
+            log_info "检测到 Python 项目但无 pyproject.toml，将生成最小配置"
+            cat > pyproject.toml << 'PYPROJEOF'
+# ============================================================================
+# Python 项目最小配置 — 由 multi-agent-workflow init.sh 自动生成
+# ============================================================================
+
+[project]
+name = "{{PROJECT_NAME}}"
+version = "0.1.0"
+description = "{{PROJECT_DESCRIPTION}}"
+requires-python = ">=3.10"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8.0",
+    "pytest>=8.0.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+]
+ignore = [
+    "E501",   # line too long (交给 formatter 处理)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+PYPROJEOF
+            # 替换占位符
+            sed -i \
+                -e "s|{{PROJECT_NAME}}|${PROJECT_NAME}|g" \
+                -e "s|{{PROJECT_DESCRIPTION}}|${project_description}|g" \
+                pyproject.toml
+            log_ok "生成 pyproject.toml（包含 ruff + pytest 配置）"
+            log_info "请运行 'uv sync --dev' 安装开发依赖"
+        fi
+    else
+        log_info "未检测到 Python 项目，跳过 pyproject.toml 生成"
+    fi
+
     # ---- Step 4: 生成 CLAUDE.md ----
     log_header "Step 4: 生成 CLAUDE.md"
 
