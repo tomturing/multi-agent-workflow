@@ -427,8 +427,7 @@ class VKDatabase:
             str:  summary 原文（可能较长）
             None: 无记录 / SQLite 不可用 / 查询失败
         """
-        db_path = self._find_db()
-        if not db_path:
+        if not os.path.exists(self._db_path):
             return None
 
         sql = """
@@ -445,8 +444,8 @@ class VKDatabase:
             LIMIT 1
         """
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,
-                                   timeout=self.QUERY_TIMEOUT)
+            conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True,
+                                   timeout=5.0)
             try:
                 cur = conn.execute(sql, (review_branch,))
                 row = cur.fetchone()
