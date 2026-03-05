@@ -99,9 +99,36 @@ else
     echo "✓  VK 已就绪（等待 ${WAITED}s）"
 fi
 
-# ── 2. 启动 Dispatcher ────────────────────────────────────────────────────────
-echo "▶  启动 Dispatcher..."
-VK_PORT="${VK_PORT}" python3 -m dispatcher --project-dir "${PROJECT_DIR}" \
+# ── 2. 定位 dispatcher 模块 ──────────────────────────────────────────────────
+# 查找顺序：
+#   1. 当前项目目录（init.sh 复制的副本）
+#   2. .vk/maw_dir 文件中记录的 MAW 路径（适合未复制 dispatcher 的场景）
+#   3. MAW_DIR 环境变量
+DISPATCHER_PYTHON_PATH=""
+if [[ -f "${PROJECT_DIR}/dispatcher/__main__.py" ]]; then
+    DISPATCHER_PYTHON_PATH="${PROJECT_DIR}"
+elif [[ -f "${PROJECT_DIR}/.vk/maw_dir" ]]; then
+    MAW_DIR_FROM_FILE="$(cat "${PROJECT_DIR}/.vk/maw_dir" | tr -d '[:space:]')"
+    if [[ -f "${MAW_DIR_FROM_FILE}/dispatcher/__main__.py" ]]; then
+        DISPATCHER_PYTHON_PATH="${MAW_DIR_FROM_FILE}"
+    fi
+elif [[ -n "${MAW_DIR:-}" ]] && [[ -f "${MAW_DIR}/dispatcher/__main__.py" ]]; then
+    DISPATCHER_PYTHON_PATH="${MAW_DIR}"
+fi
+
+if [[ -z "${DISPATCHER_PYTHON_PATH}" ]]; then
+    echo "❌  找不到 dispatcher 模块！"
+    echo "   请在 .vk/maw_dir 中写入 multi-agent-workflow 的路径，例如："
+    echo "   echo '/mnt/d/Workflow/multi-agent-workflow' > .vk/maw_dir"
+    notify "⚠️ MAW: Dispatcher 缺失" "找不到 dispatcher 模块，请查看 .vk/dev.sh 注释"
+    [[ -n "${VK_PID}" ]] && [[ "${VK_ALREADY_RUNNING}" == false ]] && kill "${VK_PID}" 2>/dev/null || true
+    exit 1
+fi
+
+# ── 3. 启动 Dispatcher ────────────────────────────────────────────────────────
+echo "▶  启动 Dispatcher（模块路径: ${DISPATCHER_PYTHON_PATH}）..."
+PYTHONPATH="${DISPATCHER_PYTHON_PATH}" VK_PORT="${VK_PORT}" \
+    python3 -m dispatcher --project-dir "${PROJECT_DIR}" \
     >> "${DISPATCHER_LOG}" 2>&1 &
 DISPATCHER_PID=$!
 
@@ -112,7 +139,7 @@ echo "   Dispatcher 日志: tail -f ${DISPATCHER_LOG}"
 echo "   按 Ctrl+C 或 make dev-down 停止"
 echo ""
 
-# ── 3. 守护：等待 Dispatcher 退出，区分崩溃 vs 用户主动停止 ──────────────────
+# ── 4. 守护：等待 Dispatcher 退出，区分崩溃 vs 用户主动停止 ──────────────────
 wait "${DISPATCHER_PID}" 2>/dev/null || true
 DISPATCHER_EXIT=$?
 

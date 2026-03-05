@@ -247,6 +247,9 @@ main() {
     # dev.sh — 一键启动守护脚本（含 VK 健康等待 + Dispatcher 异常通知）
     safe_copy "${TEMPLATE_DIR}/dev.sh" ".vk/dev.sh"
     chmod +x .vk/dev.sh 2>/dev/null || true
+    # maw_dir — 记录 MAW 安装路径，供 dev.sh 在 dispatcher 未复制时回退使用
+    echo "${SCRIPT_DIR}" > ".vk/maw_dir"
+    log_ok "写入 .vk/maw_dir → ${SCRIPT_DIR}"
 
     # scripts/
     mkdir -p scripts
