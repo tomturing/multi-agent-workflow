@@ -416,3 +416,48 @@ class VKDatabase:
             review_branch, summary[:100],
         )
         return None
+
+    def get_review_summary(self, review_branch: str) -> str | None:
+        """读取审查 Agent 的完整 summary 文本，用于传递给下一轮编码 Agent。
+
+        与 is_review_done 使用相同的 SQL，但直接返回原始 summary 字符串
+        （含审查意见全文，而非解析结论标记）。
+
+        Returns:
+            str:  summary 原文（可能较长）
+            None: 无记录 / SQLite 不可用 / 查询失败
+        """
+        db_path = self._find_db()
+        if not db_path:
+            return None
+
+        sql = """
+            SELECT cat.summary
+            FROM coding_agent_turns cat
+            JOIN execution_processes ep ON cat.execution_process_id = ep.id
+            JOIN sessions s ON ep.session_id = s.id
+            JOIN workspaces w ON s.workspace_id = w.id
+            WHERE w.branch = ?
+              AND ep.run_reason = 'codingagent'
+              AND ep.dropped = FALSE
+              AND cat.summary IS NOT NULL AND cat.summary != ''
+            ORDER BY cat.created_at DESC
+            LIMIT 1
+        """
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,
+                                   timeout=self.QUERY_TIMEOUT)
+            try:
+                cur = conn.execute(sql, (review_branch,))
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                return row[0]
+            finally:
+                conn.close()
+        except (FileNotFoundError, sqlite3.Error) as e:
+            logger.warning(
+                "VKDatabase.get_review_summary: SQLite 查询失败 (branch=%s): %s",
+                review_branch, e,
+            )
+            return None

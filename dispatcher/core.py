@@ -151,6 +151,9 @@ class IssueTracker:
     merged: bool = False
     # 时间戳
     updated_at: str = ""
+    # 多轮编码跟踪
+    coding_round: int = 1   # 当前编码轮次（CHANGES_REQUESTED 后递增），用于生成唯一 Workspace 标题
+    review_feedback: str = ""  # 上一轮审查 Agent 的反馈（CHANGES_REQUESTED 时由 SQLite 读取）
 
 
 # ============================================================================
@@ -334,9 +337,11 @@ class Dispatcher:
                 self._action_start_review(issue_id, issue, trace_id)
 
         elif new_status == "In progress" and old_status == "In review":
-            # CHANGES_REQUESTED: 审查退回 → 清空审查 Session，重置编码轮次，启动新编码
+            # CHANGES_REQUESTED: 审查退回 → 清空审查 Session，递增编码轮次，启动新编码
             logger.info("[%s] ▸ %s: CHANGES_REQUESTED → 重启编码轮次", trace_id, sid)
             t = self._trackers[issue_id]
+            t.coding_round = (t.coding_round or 1) + 1  # 递增轮次，使标题唯一
+            t.review_feedback = ""  # 人工退回时无法自动获取 feedback
             t.review_workspace_id = None
             t.review_branch = None
             t.coding_workspace_id = None  # 清空，让 _action_start_coding 创建新 workspace
@@ -480,13 +485,25 @@ class Dispatcher:
                 self._action_merge_pr(issue_id, trace_id)
         else:
             # CHANGES_REQUESTED：清空编码 Session，重新创建
+            # 1. 在清空 review_branch 前，先从 SQLite 读取审查反馈（供下一轮编码 Agent 参考）
+            if t.review_branch:
+                fb = self.vk_db.get_review_summary(t.review_branch)
+                t.review_feedback = fb or ""
+            # 2. 递增编码轮次（使 _action_start_coding 生成唯一标题，避免幂等检查复用旧 Workspace）
+            t.coding_round = (t.coding_round or 1) + 1
+            # 3. 清空会话状态
             t.coding_workspace_id = None
             t.coding_branch = None
+            t.review_workspace_id = None
+            t.review_branch = None
             self.rest.update_issue_status(issue_id, "In progress", self.config.status_map)
             t.status = "In progress"
             self._action_count += 1
             self._save_state()
-            logger.info("[%s] %s: 审查打回 → In progress，重启编码轮次", trace_id, t.simple_id)
+            logger.info(
+                "[%s] %s: 审查打回 → In progress，重启第 %d 轮编码",
+                trace_id, t.simple_id, t.coding_round,
+            )
             self._action_start_coding(issue_id, issue, trace_id)
 
     def _ensure_repo_vk_config(self, trace_id: str):
@@ -555,7 +572,10 @@ class Dispatcher:
         t = self._trackers[issue_id]
         executor = self.config.default_coder_executor
         title = issue.get("title", t.simple_id)
-        prompt = self._build_coding_prompt(issue)
+        # Round 2+ 时在标题中加入轮次号，避免幂等检查误命中上一轮已完成的 Workspace
+        if (t.coding_round or 1) > 1:
+            title = f"{title} [Round {t.coding_round}]"
+        prompt = self._build_coding_prompt(issue, t)
 
         # ---- 幂等检查: 若已存在同名且已 provision 的 workspace，直接复用 ----
         # container_ref=null 表示 VK 创建了记录但从未真正启动 agent（如目录信任检查失败）
@@ -1019,13 +1039,14 @@ class Dispatcher:
 
     # ---- 辅助方法 ----
 
-    def _build_coding_prompt(self, issue: dict) -> str | None:
-        """构建编码 prompt: 工作流规范 + 项目规范 + Issue 完整上下文
+    def _build_coding_prompt(self, issue: dict, tracker: "IssueTracker | None" = None) -> str | None:
+        """构建编码 prompt: 工作流规范 + 项目规范 + Issue 完整上下文 [+ 审查反馈]
 
         注入顺序（从宏观到具体）:
-        1. coder.md     — 工作流规范和角色职责（通用）
-        2. CLAUDE.md    — 项目编码规范、技术栈、约束（项目级）
-        3. Issue 上下文 — simple_id / title / description（任务级）
+        1. coder.md       — 工作流规范和角色职责（通用）
+        2. CLAUDE.md      — 项目编码规范、技术栈、约束（项目级）
+        3. Issue 上下文   — simple_id / title / description（任务级）
+        4. 审查反馈（可选）— 上一轮 CHANGES_REQUESTED 时审查 Agent 的意见（多轮时）
 
         Agent（Claude Code / Codex 等）收到后会:
         - 根据 Issue 描述理解任务目标
@@ -1058,7 +1079,16 @@ class Dispatcher:
 
         parts.append(issue_section)
 
-        # 4. 强制 QG 步骤（无论 Agent 是否记得，都在 prompt 最后明确要求）
+        # 4. 上一轮审查反馈（CHANGES_REQUESTED 重新编码时注入）
+        if tracker and tracker.review_feedback:
+            round_num = getattr(tracker, 'coding_round', 1)
+            parts.append(
+                f"## 上一轮审查反馈（第 {round_num - 1} 轮）\n\n"
+                f"审查 Agent 对上一轮代码的评审意见如下，**请仔细阅读并针对性地修复以下问题**：\n\n"
+                f"{tracker.review_feedback}"
+            )
+
+        # 5. 强制 QG 步骤（无论 Agent 是否记得，都在 prompt 最后明确要求）
         parts.append(
             "## 完成编码后的必要步骤\n\n"
             "代码修改并 commit 后，**必须运行以下命令**：\n\n"
