@@ -8,3 +8,4 @@ CLAUDE.local.md
 
 # 质量门禁报告
 .vk/reports/*.txt
+.vk/qg_passed/
