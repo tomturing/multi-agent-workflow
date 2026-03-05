@@ -68,6 +68,7 @@ EXCLUDE_PATTERNS=(
     "pnpm-lock.yaml"
     "yarn.lock"
     "*.sum"  # go.sum, sha256.sum 等
+    "tests/test-scan-secrets.sh"  # 测试文件本身包含 mock token 字面量，需排除
 )
 
 # ============================================================================
