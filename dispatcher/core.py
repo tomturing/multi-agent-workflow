@@ -368,6 +368,17 @@ class Dispatcher:
             self._action_start_coding(issue_id, issue, trace_id)
             return  # 已触发，不继续检查其他补偿
 
+        # In progress + 无编码 Session → 补偿启动编码
+        # 场景: 状态文件损坏/重置后重载，或 workspace provision 失败被清空
+        if (
+            t.status == "In progress"
+            and self.config.auto_start_coding
+            and not t.coding_workspace_id
+        ):
+            logger.info("[%s] ▸ %s: 补偿 — In progress 但无编码 Session，重启编码", trace_id, t.simple_id)
+            self._action_start_coding(issue_id, issue, trace_id)
+            return
+
         # In progress + 有编码 Session → SQLite 三态检查 QG 结论
         if (
             t.status == "In progress"
