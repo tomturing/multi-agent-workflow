@@ -23,6 +23,14 @@ TEMPLATE_DIR="${SCRIPT_DIR}/templates"
 SCRIPTS_DIR="${SCRIPT_DIR}/scripts"
 WORKSPACE_DIR="$(dirname "$SCRIPT_DIR")"  # multi-agent-workflow 的父目录
 
+# ---- realpath fallback ----
+# 某些系统（如 macOS）可能没有 realpath 命令
+if command -v realpath &>/dev/null; then
+    _realpath() { realpath "$1"; }
+else
+    _realpath() { python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1"; }
+fi
+
 # ---- 默认值 ----
 PROJECT_NAME=""
 NON_INTERACTIVE=false
@@ -311,6 +319,43 @@ open('CLAUDE.md', 'w').write(content)
         fi
 
         log_ok "生成 CLAUDE.md"
+    fi
+
+    # ---- Step 4.5: 注入 Dispatcher 健康检查到 CLAUDE.md ----
+    log_header "Step 4.5: Dispatcher 健康检查"
+
+    # 检查是否已注入（通过标记检测）
+    if grep -q "Dispatcher 健康检查" "CLAUDE.md" 2>/dev/null; then
+        log_skip "CLAUDE.md 中已包含 Dispatcher 健康检查"
+    else
+        # 使用 Python 进行安全的模板渲染（避免 sed 转义问题）
+        if command -v python3 &>/dev/null; then
+            local PROJECT_DIR_ABS="$(_realpath "$PROJECT_DIR")"
+            local DISPATCHER_DIR_ABS="$(_realpath "$SCRIPT_DIR")"
+            local PROJECT_NAME_SAFE="$(basename "$PROJECT_DIR")"
+
+            python3 -c "
+import sys
+
+# 读取模板
+with open('${TEMPLATE_DIR}/claude_dispatcher_check.md', 'r') as f:
+    template = f.read()
+
+# 安全替换占位符（无需转义，Python 字符串替换自动处理特殊字符）
+content = template.replace('{{PROJECT_DIR}}', '''$PROJECT_DIR_ABS''')
+content = content.replace('{{DISPATCHER_DIR}}', '''$DISPATCHER_DIR_ABS''')
+content = content.replace('{{PROJECT_NAME}}', '''$PROJECT_NAME_SAFE''')
+
+# 追加到 CLAUDE.md
+with open('CLAUDE.md', 'a') as f:
+    f.write('\n')
+    f.write(content)
+
+print('  ✓ 注入 Dispatcher 健康检查到 CLAUDE.md')
+"
+        else
+            log_skip "Python3 不可用，跳过 Dispatcher 健康检查注入"
+        fi
     fi
 
     # ---- Step 5: 创建 AGENTS.md 符号链接 ----
