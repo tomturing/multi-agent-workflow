@@ -438,6 +438,7 @@ class Dispatcher:
                     "[%s] %s: 审查 Agent 真实失败（SQLite 检测），请人工介入 (branch=%s)",
                     trace_id, t.simple_id, t.review_branch,
                 )
+                return  # 保持 In review，防止补偿逻辑重建新 review session
             # None → 仍在运行，下轮再检查
 
         # In review 但无审查 Session → 补偿创建
