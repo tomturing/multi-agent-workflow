@@ -279,35 +279,46 @@ main() {
         log_skip "CLAUDE.md（已存在，不覆盖。如需重新生成，请先删除）"
     else
         # 从模板生成，替换占位符
-        sed \
-            -e "s|{{PROJECT_NAME}}|${PROJECT_NAME}|g" \
-            -e "s|{{PROJECT_DESCRIPTION}}|${project_description}|g" \
-            -e "s|{{PROJECT_VERSION}}|${project_version}|g" \
-            -e "s|{{BACKEND_STACK}}|${backend_stack}|g" \
-            -e "s|{{FRONTEND_STACK}}|${frontend_stack}|g" \
-            -e "s|{{DATABASE_STACK}}|${database_stack}|g" \
-            -e "s|{{DEPLOY_STACK}}|${deploy_stack}|g" \
-            -e "s|{{PACKAGE_MANAGERS}}|${package_managers}|g" \
-            -e "s|{{VK_SETUP_SCRIPT}}|${vk_setup_script}|g" \
-            -e "s|{{VK_DEV_SERVER}}|${vk_dev_server}|g" \
-            "${TEMPLATE_DIR}/CLAUDE.md.tmpl" > "CLAUDE.md"
-
-        # 多行字段需要特殊处理（sed 不好处理多行）
-        # 使用 python 或 awk 替换（如果有的话）
         if command -v python3 &>/dev/null; then
             python3 -c "
-import sys
-content = open('CLAUDE.md').read()
+import sys, json
 replacements = {
+    '{{PROJECT_NAME}}': '''${PROJECT_NAME}''',
+    '{{PROJECT_DESCRIPTION}}': '''${project_description}''',
+    '{{PROJECT_VERSION}}': '''${project_version}''',
+    '{{BACKEND_STACK}}': '''${backend_stack}''',
+    '{{FRONTEND_STACK}}': '''${frontend_stack}''',
+    '{{DATABASE_STACK}}': '''${database_stack}''',
+    '{{DEPLOY_STACK}}': '''${deploy_stack}''',
+    '{{PACKAGE_MANAGERS}}': '''${package_managers}''',
+    '{{VK_SETUP_SCRIPT}}': '''${vk_setup_script}''',
+    '{{VK_DEV_SERVER}}': '''${vk_dev_server}''',
     '{{DIRECTORY_STRUCTURE}}': '''$(echo -e "$directory_structure")''',
     '{{CODING_CONVENTIONS}}': '''$(echo -e "$coding_conventions")''',
     '{{BUILD_COMMANDS}}': '''$(echo -e "$build_commands")''',
     '{{FORBIDDEN_OPERATIONS}}': '''$(echo -e "$forbidden_operations")''',
 }
+with open('${TEMPLATE_DIR}/CLAUDE.md.tmpl', 'r') as f:
+    content = f.read()
 for k, v in replacements.items():
     content = content.replace(k, v)
-open('CLAUDE.md', 'w').write(content)
+with open('CLAUDE.md', 'w') as f:
+    f.write(content)
 "
+        else
+            # fallback: use sed for simple string ones, but it might break on special chars
+            sed \
+                -e "s|{{PROJECT_NAME}}|${PROJECT_NAME}|g" \
+                -e "s|{{PROJECT_DESCRIPTION}}|${project_description}|g" \
+                -e "s|{{PROJECT_VERSION}}|${project_version}|g" \
+                -e "s|{{BACKEND_STACK}}|${backend_stack}|g" \
+                -e "s|{{FRONTEND_STACK}}|${frontend_stack}|g" \
+                -e "s|{{DATABASE_STACK}}|${database_stack}|g" \
+                -e "s|{{DEPLOY_STACK}}|${deploy_stack}|g" \
+                -e "s|{{PACKAGE_MANAGERS}}|${package_managers}|g" \
+                -e "s|{{VK_SETUP_SCRIPT}}|${vk_setup_script}|g" \
+                -e "s|{{VK_DEV_SERVER}}|${vk_dev_server}|g" \
+                "${TEMPLATE_DIR}/CLAUDE.md.tmpl" > "CLAUDE.md"
         fi
 
         log_ok "生成 CLAUDE.md"

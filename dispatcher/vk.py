@@ -30,6 +30,7 @@ logger = logging.getLogger("dispatcher.vk")
 #  VK REST API 客户端
 # ============================================================================
 
+
 class VKRestClient:
     """VK REST API 客户端 — 用于轮询和状态更新"""
 
@@ -39,9 +40,7 @@ class VKRestClient:
     def health_check(self) -> bool:
         """检查 VK 服务是否可达"""
         try:
-            resp = urllib.request.urlopen(
-                f"{self.base_url}/api/health", timeout=5
-            )
+            resp = urllib.request.urlopen(f"{self.base_url}/api/health", timeout=5)
             return resp.status == 200
         except (urllib.error.URLError, OSError):
             return False
@@ -52,10 +51,7 @@ class VKRestClient:
         Returns:
             Issue 字典列表，每个包含 id, title, status, status_id, simple_id 等字段
         """
-        url = (
-            f"{self.base_url}/api/remote/issues"
-            f"?project_id={project_id}&limit={limit}"
-        )
+        url = f"{self.base_url}/api/remote/issues?project_id={project_id}&limit={limit}"
         resp = urllib.request.urlopen(url, timeout=10)
         data = json.loads(resp.read().decode())
         # VK REST API 响应结构: {success: true, data: {issues: [...]}}
@@ -69,9 +65,7 @@ class VKRestClient:
         注意: /api/task-attempts 返回 {success, data: [...]} 信封格式。
         """
         try:
-            resp = urllib.request.urlopen(
-                f"{self.base_url}/api/task-attempts", timeout=10
-            )
+            resp = urllib.request.urlopen(f"{self.base_url}/api/task-attempts", timeout=10)
             envelope: dict = json.loads(resp.read().decode())
             # 解包信封: {success: true, data: [...]}
             workspaces: list = envelope.get("data", [])
@@ -91,21 +85,7 @@ class VKRestClient:
     def get_workspace_by_id(self, ws_id: str) -> dict | None:
         """按 ID 获取 workspace 详情（含 container_ref / agent_working_dir）"""
         try:
-            resp = urllib.request.urlopen(
-                f"{self.base_url}/api/task-attempts/{ws_id}", timeout=10
-            )
-            envelope: dict = json.loads(resp.read().decode())
-            return envelope.get("data") or envelope
-        except Exception as e:
-            logger.warning("get_workspace_by_id(%s) 失败: %s", ws_id, e)
-            return None
-
-    def get_workspace_by_id(self, ws_id: str) -> dict | None:
-        """按 ID 获取 workspace 详情（含 container_ref / agent_working_dir）"""
-        try:
-            resp = urllib.request.urlopen(
-                f"{self.base_url}/api/task-attempts/{ws_id}", timeout=10
-            )
+            resp = urllib.request.urlopen(f"{self.base_url}/api/task-attempts/{ws_id}", timeout=10)
             envelope: dict = json.loads(resp.read().decode())
             # 响应结构: {success, data: {...}} 或直接返回对象
             return envelope.get("data") or envelope
@@ -188,6 +168,7 @@ class VKRestClient:
 #  VK MCP stdio 客户端
 # ============================================================================
 
+
 class VKMCPClient:
     """VK MCP stdio 客户端 — 用于创建 Session 等 REST 不支持的操作
 
@@ -256,11 +237,13 @@ class VKMCPClient:
             return False
 
         # 发送 initialized 通知（必须，否则 tools/list 返回空）
-        self._send({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-            "params": {},
-        })
+        self._send(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            }
+        )
         time.sleep(0.3)
         return True
 
@@ -272,6 +255,7 @@ class VKMCPClient:
         返回最新版本的路径，未找到则返回 None。
         """
         import glob
+
         home = os.path.expanduser("~")
         pattern = os.path.join(home, ".vibe-kanban", "bin", "*", "*", "vibe-kanban-mcp")
         candidates = sorted(glob.glob(pattern))
@@ -339,9 +323,7 @@ class VKMCPClient:
         Returns:
             Workspace 字典列表，每个包含 id, branch, name 等字段
         """
-        result = self._call_tool(
-            "list_workspaces", {"organization_id": organization_id}
-        )
+        result = self._call_tool("list_workspaces", {"organization_id": organization_id})
         if result and isinstance(result, dict):
             return result.get("workspaces", [])
         return []
@@ -359,15 +341,22 @@ class VKMCPClient:
         """
         if status_names is None:
             status_names = [
-                "Backlog", "To do", "In progress",
-                "In review", "Done", "Cancelled",
+                "Backlog",
+                "To do",
+                "In progress",
+                "In review",
+                "Done",
+                "Cancelled",
             ]
 
         # 创建临时探针 issue
-        result = self._call_tool("create_issue", {
-            "project_id": project_id,
-            "title": "__status_discovery_probe__",
-        })
+        result = self._call_tool(
+            "create_issue",
+            {
+                "project_id": project_id,
+                "title": "__status_discovery_probe__",
+            },
+        )
         if not result:
             logger.error("创建探针 Issue 失败")
             return {}
@@ -382,10 +371,13 @@ class VKMCPClient:
 
         try:
             for status_name in status_names:
-                self._call_tool("update_issue", {
-                    "issue_id": issue_id,
-                    "status": status_name,
-                })
+                self._call_tool(
+                    "update_issue",
+                    {
+                        "issue_id": issue_id,
+                        "status": status_name,
+                    },
+                )
                 time.sleep(0.3)  # 等待后端写库
                 issue_data = rest_client.get_issue(issue_id)
                 if issue_data:
@@ -460,12 +452,14 @@ class VKMCPClient:
     def _call(self, method: str, params: dict) -> dict | None:
         """发送 JSON-RPC 请求并等待响应"""
         self._req_id += 1
-        self._send({
-            "jsonrpc": "2.0",
-            "id": self._req_id,
-            "method": method,
-            "params": params,
-        })
+        self._send(
+            {
+                "jsonrpc": "2.0",
+                "id": self._req_id,
+                "method": method,
+                "params": params,
+            }
+        )
         return self._recv()
 
     def _send(self, msg: dict):

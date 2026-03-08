@@ -177,10 +177,9 @@ vk_on_cleanup_success() {
                 echo -e "  \033[0;32m✓\033[0m QG 标记已写入: ${sha:0:8}"
             fi
 
-            # 若 Dispatcher 兜底模式（VK_SKIP_STATUS_UPDATE=1），跳过 REST 状态更新
-            # Dispatcher 自行明确踟进 In review，避免与 REST 之间突变
-            if [ "${VK_SKIP_STATUS_UPDATE:-0}" = "1" ]; then
-                echo -e "  ℹ VK_SKIP_STATUS_UPDATE=1，跳过状态更新（Dispatcher 处理）"
+            # 统一交由 Dispatcher 通过直读 SQLite 状态来完成流转，避免数据撕裂
+            if [ "${VK_SKIP_STATUS_UPDATE:-1}" = "1" ]; then
+                echo -e "  ℹ 默认跳过 REST 状态更新，由 Dispatcher 在 SQLite 检测通过后统一推进流程。"
             else
                 _vk_update_issue_status "$issue_id" "In review" || true
             fi

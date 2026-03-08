@@ -71,9 +71,7 @@ class VKDatabase:
         uri = f"file:{self._db_path}?mode=ro"
         return sqlite3.connect(uri, uri=True, check_same_thread=False)
 
-    def get_latest_process(
-        self, branch: str, run_reason: str
-    ) -> Optional[dict]:
+    def get_latest_process(self, branch: str, run_reason: str) -> Optional[dict]:
         """获取指定分支、指定 run_reason 的最新执行进程记录。
 
         Args:
@@ -117,7 +115,9 @@ class VKDatabase:
             logger.warning("VKDatabase: %s", e)
             return None
         except sqlite3.Error as e:
-            logger.warning("VKDatabase: SQLite 查询失败 (branch=%s reason=%s): %s", branch, run_reason, e)
+            logger.warning(
+                "VKDatabase: SQLite 查询失败 (branch=%s reason=%s): %s", branch, run_reason, e
+            )
             return None
 
     def has_cleanup_script(self, branch: str) -> bool:
@@ -225,9 +225,7 @@ class VKDatabase:
             )
             return None
 
-    def _evaluate_process(
-        self, proc: dict, label: str, branch: str
-    ) -> Optional[bool]:
+    def _evaluate_process(self, proc: dict, label: str, branch: str) -> Optional[bool]:
         """根据进程记录判断成功/失败/运行中。
 
         VK 重启 artifact 识别：exit_code IS NULL + status='failed'
@@ -254,14 +252,18 @@ class VKDatabase:
             # cleanup_orphan_executions() 将进程标记为 Failed，不代表 Agent 真的失败
             logger.debug(
                 "VKDatabase: 分支 %s %s exit_code=NULL（VK 重启 artifact），忽略",
-                branch, label,
+                branch,
+                label,
             )
             return None
 
         # exit_code IS NOT NULL AND (exit_code != 0 OR status in ['failed', 'killed'])
         logger.warning(
             "VKDatabase: 分支 %s %s 真实失败 (status=%s, exit_code=%s)",
-            branch, label, status, exit_code,
+            branch,
+            label,
+            status,
+            exit_code,
         )
         return False
 
@@ -345,6 +347,7 @@ class VKDatabase:
         Returns:
             'approved'           — 审查通过，可流转 Done
             'changes_requested'  — 审查打回，可流转 In progress
+            'unknown'            — 结论未知，转交调度器判定（常用于流转回 In progress 等待人工）
             False                — Agent 真实失败，等待人工介入
             None                 — 仍在运行 / 尚未开始 / 无法判断
         """
@@ -392,7 +395,9 @@ class VKDatabase:
             finally:
                 conn.close()
         except (FileNotFoundError, sqlite3.Error) as e:
-            logger.warning("VKDatabase.is_review_done: SQLite 查询失败 (branch=%s): %s", review_branch, e)
+            logger.warning(
+                "VKDatabase.is_review_done: SQLite 查询失败 (branch=%s): %s", review_branch, e
+            )
             return None
 
         # 解析标准结论标记（不区分大小写）
@@ -400,22 +405,25 @@ class VKDatabase:
         if "APPROVED" in summary_upper and "CHANGES_REQUESTED" not in summary_upper:
             logger.info(
                 "VKDatabase.is_review_done: 分支 %s 审查通过 ✓ (summary 前100字: %s)",
-                review_branch, summary[:100],
+                review_branch,
+                summary[:100],
             )
             return "approved"
         if "CHANGES_REQUESTED" in summary_upper:
             logger.info(
                 "VKDatabase.is_review_done: 分支 %s 审查打回 (summary 前100字: %s)",
-                review_branch, summary[:100],
+                review_branch,
+                summary[:100],
             )
             return "changes_requested"
 
-        # summary 存在但不含标准标记 → Agent 可能未加结论，保守返回 None
-        logger.debug(
-            "VKDatabase.is_review_done: 分支 %s summary 无标准结论标记，等待下轮 (summary 前100字: %s)",
-            review_branch, summary[:100],
+        # summary 存在但不含标准标记 → 视作格式不合规的未知状态，返回 unknown 防止卡死
+        logger.warning(
+            "VKDatabase.is_review_done: 分支 %s summary 无标准结论标记，按照未知(unknown)处理 (summary 前100字: %s)",
+            review_branch,
+            summary[:100],
         )
-        return None
+        return "unknown"
 
     def get_review_summary(self, review_branch: str) -> str | None:
         """读取审查 Agent 的完整 summary 文本，用于传递给下一轮编码 Agent。
@@ -444,8 +452,7 @@ class VKDatabase:
             LIMIT 1
         """
         try:
-            conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True,
-                                   timeout=5.0)
+            conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, timeout=5.0)
             try:
                 cur = conn.execute(sql, (review_branch,))
                 row = cur.fetchone()
@@ -457,6 +464,7 @@ class VKDatabase:
         except (FileNotFoundError, sqlite3.Error) as e:
             logger.warning(
                 "VKDatabase.get_review_summary: SQLite 查询失败 (branch=%s): %s",
-                review_branch, e,
+                review_branch,
+                e,
             )
             return None

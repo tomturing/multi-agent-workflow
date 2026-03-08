@@ -110,22 +110,39 @@ detect_project_structure() {
         readarray -t PYTHON_SRC_DIRS < <(printf '%s\n' "${PYTHON_SRC_DIRS[@]}" | sort -u)
 
         # 发现测试目录
-        for d in tests test; do
-            [ -d "$d" ] && PYTHON_TEST_DIRS+=("$d")
-        done
-        while IFS= read -r tdir; do
-            local rel="${tdir#./}"
-            [[ "$rel" == "tests" || "$rel" == "test" ]] && continue
-            PYTHON_TEST_DIRS+=("$rel")
-        done < <(find . -maxdepth 3 -type d -name "tests" \
-                     -not -path "./.git/*" -not -path "*/.venv/*" \
-                     2>/dev/null | grep -v '^\./tests$' | head -20)
+        # 优先读取 pyproject.toml 中 [tool.quality-gate] test_dirs 配置
+        local qg_test_dirs_override
+        qg_test_dirs_override=$(python3 -c "
+try:
+    import tomllib
+except ImportError:
+    try: import tomli as tomllib
+    except ImportError: tomllib = None
+if tomllib:
+    with open('pyproject.toml', 'rb') as f:
+        d = tomllib.load(f)
+    dirs = d.get('tool', {}).get('quality-gate', {}).get('test_dirs', [])
+    if dirs: print('\\n'.join(dirs))
+" 2>/dev/null || true)
 
-        readarray -t PYTHON_TEST_DIRS < <(printf '%s\n' "${PYTHON_TEST_DIRS[@]}" | sort -u)
+        if [ -n "$qg_test_dirs_override" ]; then
+            readarray -t PYTHON_TEST_DIRS <<< "$qg_test_dirs_override"
+            log_info "测试目录 (来自 pyproject.toml [tool.quality-gate]): ${PYTHON_TEST_DIRS[*]}"
+        else
+            for d in tests test; do
+                [ -d "$d" ] && PYTHON_TEST_DIRS+=("$d")
+            done
+            while IFS= read -r tdir; do
+                local rel="${tdir#./}"
+                [[ "$rel" == "tests" || "$rel" == "test" ]] && continue
+                PYTHON_TEST_DIRS+=("$rel")
+            done < <(find . -maxdepth 3 -type d -name "tests" \
+                         -not -path "./.git/*" -not -path "*/.venv/*" \
+                         2>/dev/null | grep -v '^\./tests$' | head -20)
 
-        log_info "Python: ✓  运行器=${PYTHON_RUNNER:-未找到}"
-        log_info "源码目录: ${PYTHON_SRC_DIRS[*]:-（未发现，将检查根目录 *.py）}"
-        log_info "测试目录: ${PYTHON_TEST_DIRS[*]:-（未发现）}"
+            readarray -t PYTHON_TEST_DIRS < <(printf '%s\n' "${PYTHON_TEST_DIRS[@]}" | sort -u)
+            log_info "测试目录: ${PYTHON_TEST_DIRS[*]:-（未发现）}"
+        fi
     else
         log_info "Python 项目: 未检测到"
     fi
@@ -161,12 +178,11 @@ detect_changes() {
     git rev-parse --verify "$base_branch" &>/dev/null || base_branch="master"
 
     local changed
-    if git merge-base --is-ancestor "$base_branch" HEAD 2>/dev/null; then
-        changed=$(git diff --name-only "$base_branch"...HEAD 2>/dev/null || true)
-    else
-        changed=$(git diff --name-only HEAD 2>/dev/null || true)
-    fi
+    # 在 Git worktree 里，三点 diff 最可靠；merge-base 检查只是可选的兜底
+    # 不再依赖 merge-base --is-ancestor，因为在 worktree 下图谱未同步时会误判
+    changed=$(git diff --name-only "${base_branch}...HEAD" 2>/dev/null || true)
     if [ -z "$changed" ]; then
+        # 兜底：对比暂存区 + 未暂存变更（未 commit 的情形）
         changed=$(git diff --name-only 2>/dev/null || true)
         changed+=$'\n'
         changed+=$(git diff --name-only --cached 2>/dev/null || true)
@@ -178,8 +194,9 @@ detect_changes() {
         [[ "$f" == frontend/* || "$f" == *.ts || "$f" == *.vue || "$f" == *.tsx ]] \
             && HAS_FRONTEND_CHANGES=true
     done <<< "$changed"
+    
+    return 0
 }
-
 # ============================================================================
 # Python 检查
 # ============================================================================
@@ -236,6 +253,25 @@ check_python_test() {
         log_skip "pytest 未安装"; return
     fi
 
+    # 超时配置：优先环境变量，其次 pyproject.toml [tool.quality-gate] test_timeout，默认 120s
+    local per_test_timeout="${QG_TEST_TIMEOUT:-}"
+    if [ -z "$per_test_timeout" ]; then
+        per_test_timeout=$(python3 -c "
+try:
+    import tomllib
+except ImportError:
+    try: import tomli as tomllib
+    except ImportError: tomllib = None
+if tomllib:
+    with open('pyproject.toml', 'rb') as f:
+        d = tomllib.load(f)
+    print(d.get('tool', {}).get('quality-gate', {}).get('test_timeout', 120))
+else:
+    print(120)
+" 2>/dev/null || echo 120)
+    fi
+    log_info "pytest 单测超时限制: ${per_test_timeout}s/套件 (可通过 QG_TEST_TIMEOUT 或 pyproject.toml 覆盖)"
+
     local all_pass=true
     for tdir in "${PYTHON_TEST_DIRS[@]}"; do
         [[ -z "$tdir" ]] && continue   # 过滤空元素（readarray 可能产生）
@@ -243,9 +279,13 @@ check_python_test() {
         [ -d "${tdir}/integration" ] && ignore_flags+=("--ignore=${tdir}/integration")
         # exit code 5 = no tests collected，不算失败
         local ec=0
-        $pytest_cmd "$tdir" "${ignore_flags[@]}" -q --tb=short 2>/dev/null || ec=$?
+        timeout "${per_test_timeout}" \
+            $pytest_cmd "$tdir" "${ignore_flags[@]}" -q --tb=short 2>/dev/null || ec=$?
         if [ $ec -eq 0 ] || [ $ec -eq 5 ]; then
             log_pass "${tdir} — 通过"
+        elif [ $ec -eq 124 ]; then
+            log_fail "${tdir} — 超时（>${per_test_timeout}s），疑似 import 卡在 DB 连接。建议在 pyproject.toml [tool.quality-gate] 的 test_dirs 中只保留纯单元测试目录。"
+            all_pass=false
         else
             log_fail "${tdir} — 部分失败 (exit=$ec)"
             all_pass=false
@@ -292,6 +332,22 @@ main() {
     log_header "Agent 质量门禁 — $(date '+%Y-%m-%d %H:%M:%S')"
     echo -e "  项目: ${PROJECT_ROOT}"
     echo -e "  分支: $(git branch --show-current 2>/dev/null || echo 'unknown')"
+
+    # ---- 逃生窗：如果提供项目自定义脚本，直接执行并退出 ----
+    if [ -f "${PROJECT_ROOT}/.vk/quality-gate.conf" ]; then
+        log_info "发现 .vk/quality-gate.conf，跳过默认执行，运行自定义门禁逻辑。"
+        bash "${PROJECT_ROOT}/.vk/quality-gate.conf"
+        local exit_code=$?
+        if [ $exit_code -eq 0 ]; then
+            log_pass "自定义质量门禁通过"
+            type vk_on_cleanup_success &>/dev/null && vk_on_cleanup_success
+            exit 0
+        else
+            log_fail "自定义质量门禁失败 (exit=$exit_code)"
+            type vk_on_cleanup_failure &>/dev/null && vk_on_cleanup_failure
+            exit $exit_code
+        fi
+    fi
 
     detect_project_structure
     detect_changes
