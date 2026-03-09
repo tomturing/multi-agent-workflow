@@ -83,6 +83,12 @@ class DispatcherConfig:
     coding_prompt_file: str = ".vk/prompts/coder.md"
     review_prompt_file: str = ".vk/prompts/reviewer.md"
 
+    # ---- 可选: 悲观等待 / STUCK 阈值 ----
+    max_coding_retries: int = 2          # coding session 最大重试次数（超出后标记 Blocked）
+    max_review_retries: int = 2          # review session 最大重试次数
+    max_coding_wait_minutes: int = 60    # coding session 超时阈值（分钟）
+    max_review_wait_minutes: int = 15    # review session 完成后等待 issue.status 变化的超时（分钟）
+
     # ---- 运行时加载 ----
     status_map: dict = field(default_factory=dict)
 
@@ -130,6 +136,10 @@ class DispatcherConfig:
             ),
             coding_prompt_file=data.get("coding_prompt_file", ".vk/prompts/coder.md"),
             review_prompt_file=data.get("review_prompt_file", ".vk/prompts/reviewer.md"),
+            max_coding_retries=int(data.get("max_coding_retries", 2)),
+            max_review_retries=int(data.get("max_review_retries", 2)),
+            max_coding_wait_minutes=int(data.get("max_coding_wait_minutes", 60)),
+            max_review_wait_minutes=int(data.get("max_review_wait_minutes", 15)),
             status_map=status_map,
         )
 
@@ -163,7 +173,12 @@ class IssueTracker:
     updated_at: str = ""
     # 多轮编码跟踪
     coding_round: int = 1  # 当前编码轮次（CHANGES_REQUESTED 后递增），用于生成唯一 Workspace 标题
-    review_feedback: str = ""  # 上一轮审查 Agent 的反馈（CHANGES_REQUESTED 时由 SQLite 读取）
+    review_feedback: str = ""  # 上一轮审查反馈（从 issue.description 读取）
+    # STUCK 状态跟踪（悲观等待范式）
+    stuck_reason: str | None = None   # 卡住的原因描述
+    retry_count: int = 0              # 当前阶段已重试次数
+    stuck_since: str | None = None    # 进入 STUCK 的时间戳（ISO 格式）
+    last_exit_code: int | None = None # 上次 coding/cleanup 失败的 exit_code（注入重试提示用）
 
 
 # ============================================================================
@@ -356,14 +371,18 @@ class Dispatcher:
                 self._action_start_review(issue_id, issue, trace_id)
 
         elif new_status == "In progress" and old_status == "In review":
-            # CHANGES_REQUESTED: 审查退回 → 清空审查 Session，递增编码轮次，启动新编码
+            # CHANGES_REQUESTED: Reviewer Agent 通过 MCP 把 issue 改为 In progress
+            # 审查反馈已由 Reviewer 写入 issue.description，从那里读取
             logger.info("[%s] ▸ %s: CHANGES_REQUESTED → 重启编码轮次", trace_id, sid)
             t = self._trackers[issue_id]
-            t.coding_round = (t.coding_round or 1) + 1  # 递增轮次，使标题唯一
-            t.review_feedback = ""  # 人工退回时无法自动获取 feedback
+            feedback = self._extract_review_feedback(issue.get("description") or "")
+            t.review_feedback = feedback
+            t.coding_round = (t.coding_round or 1) + 1
             t.review_workspace_id = None
             t.review_branch = None
-            t.coding_workspace_id = None  # 清空，让 _action_start_coding 创建新 workspace
+            t.coding_workspace_id = None
+            t.stuck_since = None
+            t.retry_count = 0
             self._action_start_coding(issue_id, issue, trace_id)
 
         elif new_status == "Done" and self.config.auto_merge:
@@ -374,17 +393,27 @@ class Dispatcher:
         """检查当前状态是否有未完成的补偿动作
 
         场景: 调度器在动作执行中途崩溃重启，或启动时 Issue 已在某状态
+
+        悲观等待范式：信号不明确时停止等待，不猜测推进。
+        只认可两类可信信号：
+          1. VK 基础设施写入的字段（exit_code、issue.status）
+          2. 超时（可信的"没有信号"信号）
         """
         t = self._trackers[issue_id]
+
+        # 已被标记为 Blocked → 不再处理，等待人工介入
+        if t.stuck_reason and t.retry_count >= max(
+            self.config.max_coding_retries, self.config.max_review_retries
+        ):
+            return
 
         # To do 且无编码 Session → 补偿启动编码（冷启动时 To do 已存在的 issue）
         if t.status == "To do" and self.config.auto_start_coding and not t.coding_workspace_id:
             logger.info("[%s] ▸ %s: 补偿 — To do 但无编码 Session", trace_id, t.simple_id)
             self._action_start_coding(issue_id, issue, trace_id)
-            return  # 已触发，不继续检查其他补偿
+            return
 
         # In progress + 无编码 Session → 补偿启动编码
-        # 场景: 状态文件损坏/重置后重载，或 workspace provision 失败被清空
         if (
             t.status == "In progress"
             and self.config.auto_start_coding
@@ -396,27 +425,27 @@ class Dispatcher:
             self._action_start_coding(issue_id, issue, trace_id)
             return
 
-        # In progress + 有编码 Session → SQLite 三态检查 QG 结论
+        # In progress + 有编码 Session → 检查 QG 结论（基础设施信号：exit_code）
         if t.status == "In progress" and t.coding_workspace_id and t.coding_branch:
             qg_result = self.vk_db.is_qg_passed(t.coding_branch)
             if qg_result is True:
-                # cleanup_script completed + exit_code=0 → QG 通过，流转 In review
+                # exit_code=0 → QG 通过，流转 In review
                 logger.info(
-                    "[%s] ▸ %s: SQLite 检测到 QG 通过 (branch=%s)，移入 In review",
-                    trace_id,
-                    t.simple_id,
-                    t.coding_branch,
+                    "[%s] ▸ %s: QG 通过 (branch=%s)，移入 In review",
+                    trace_id, t.simple_id, t.coding_branch,
                 )
+                t.stuck_reason = None
+                t.retry_count = 0
+                t.stuck_since = None
+                t.last_exit_code = None
                 self._action_finish_coding(issue_id, issue, trace_id)
             elif qg_result is False:
-                # cleanup_script 真实失败（非 dropped）→ 等待人工介入
-                logger.warning(
-                    "[%s] %s: QG 失败（SQLite 检测），请人工介入 (branch=%s)",
-                    trace_id,
-                    t.simple_id,
-                    t.coding_branch,
-                )
-            # None → codingagent/cleanupscript 仍在运行，下轮再检查
+                # exit_code != 0 → 真实失败，重建 session 或标记 Blocked
+                self._handle_coding_failure(issue_id, issue, trace_id)
+            else:
+                # None → 仍在运行，检查是否超时
+                if self.vk_db.is_coding_timed_out(t.coding_branch, self.config.max_coding_wait_minutes):
+                    self._handle_coding_failure(issue_id, issue, trace_id, reason="超时")
             return
 
         # In review 但无 PR → 补偿创建 PR
@@ -429,45 +458,37 @@ class Dispatcher:
             logger.info("[%s] ▸ %s: 补偿 — In review 但无 PR", trace_id, t.simple_id)
             self._action_create_pr(issue_id, issue, trace_id)
 
-        # In review + 有审查 Session → 读 SQLite summary 检测审查结论（E45-计划）
+        # In review + 有审查 Session → 等待 issue.status 变化（由 Reviewer Agent 通过 MCP 写入）
+        # 不再解析 SQLite summary：信号来源变更为 VK issue.status（基础设施级信号）
         if t.status == "In review" and t.review_workspace_id and t.review_branch:
-            review_result = self.vk_db.is_review_done(t.review_branch)
-            if review_result == "approved":
-                logger.info(
-                    "[%s] ▸ %s: SQLite 检测到审查通过 (branch=%s)，移入 Done",
-                    trace_id,
-                    t.simple_id,
-                    t.review_branch,
-                )
-                self._action_finish_review(issue_id, issue, trace_id, approved=True)
-                return
-            elif review_result == "changes_requested":
-                logger.info(
-                    "[%s] ▸ %s: SQLite 检测到审查打回 (branch=%s)，移入 In progress",
-                    trace_id,
-                    t.simple_id,
-                    t.review_branch,
-                )
-                self._action_finish_review(issue_id, issue, trace_id, approved=False)
-                return
-            elif review_result == "unknown":
+            review_agent_done = self.vk_db.is_qg_passed(t.review_branch)
+            if review_agent_done is True:
+                # Review agent 的 codingagent 进程已完成，应该已通过 MCP 改了 issue.status
+                # 但我们在 _check_pending 时 issue.status 还没变（仍是 In review）
+                # → 等待下一轮轮询捕获状态变化，或超时后重建 review session
+                if self._is_review_status_wait_timed_out(t):
+                    logger.warning(
+                        "[%s] ⚠️ STUCK: %s review agent 已完成但 issue.status 未变化，超时 %d 分钟，重建 review session",
+                        trace_id, t.simple_id, self.config.max_review_wait_minutes,
+                    )
+                    self._handle_review_stuck(issue_id, issue, trace_id)
+                else:
+                    # 标记为等待状态变化（非 STUCK，只是等）
+                    if not t.stuck_since:
+                        t.stuck_since = datetime.now(UTC).isoformat()
+                        logger.info(
+                            "[%s] %s: review agent 完成，等待 issue.status 变化... (最多 %d 分钟)",
+                            trace_id, t.simple_id, self.config.max_review_wait_minutes,
+                        )
+            elif review_agent_done is False:
+                # Review agent 真实失败（exit_code!=0）
                 logger.warning(
-                    "[%s] ▸ %s: SQLite 检测到审查结论未知 (branch=%s)，流转回 In progress 等待人工审核或重跑",
-                    trace_id,
-                    t.simple_id,
-                    t.review_branch,
+                    "[%s] ⚠️ STUCK: %s review agent 失败 (branch=%s)",
+                    trace_id, t.simple_id, t.review_branch,
                 )
-                self._action_finish_review(issue_id, issue, trace_id, approved=False)
-                return
-            elif review_result is False:
-                logger.warning(
-                    "[%s] %s: 审查 Agent 真实失败（SQLite 检测），请人工介入 (branch=%s)",
-                    trace_id,
-                    t.simple_id,
-                    t.review_branch,
-                )
-                return  # 保持 In review，防止补偿逻辑重建新 review session
-            # None → 仍在运行，下轮再检查
+                self._handle_review_stuck(issue_id, issue, trace_id)
+            # None → review agent 仍在运行，下轮再检查
+            return
 
         # In review 但无审查 Session → 补偿创建
         if t.status == "In review" and self.config.auto_start_review and not t.review_workspace_id:
@@ -478,6 +499,108 @@ class Dispatcher:
         if t.status == "Done" and self.config.auto_merge and not t.pr_merged and t.pr_number:
             logger.info("[%s] ▸ %s: 补偿 — Done 但 PR 未合并", trace_id, t.simple_id)
             self._action_merge_pr(issue_id, trace_id)
+
+    def _handle_coding_failure(
+        self, issue_id: str, issue: dict, trace_id: str, reason: str = "失败"
+    ):
+        """处理 coding/cleanup 失败或超时：重试或标记 Blocked。"""
+        t = self._trackers[issue_id]
+        if t.retry_count >= self.config.max_coding_retries:
+            # 超过重试上限 → Blocked
+            self._mark_blocked(
+                issue_id, trace_id,
+                f"coding {reason}，已重试 {t.retry_count} 次，超过上限 {self.config.max_coding_retries}",
+            )
+            return
+
+        # 记录 exit_code 用于注入 extra_context
+        proc = self.vk_db.get_latest_process(t.coding_branch, "cleanupscript") or \
+               self.vk_db.get_latest_process(t.coding_branch, "codingagent")
+        if proc:
+            t.last_exit_code = proc.get("exit_code")
+
+        extra_context = (
+            f"**上一次执行{reason}**（exit_code={t.last_exit_code}）。\n"
+            "请检查 VK Logs 面板中的错误信息，找到根因后修复，然后重新完成任务。\n"
+            "不要跳过 `bash scripts/agent-quality-gate.sh` 步骤。"
+        )
+
+        logger.warning(
+            "[%s] ⚠️ %s: coding %s (exit_code=%s)，第 %d 次重试，重建编码 Session",
+            trace_id, t.simple_id, reason, t.last_exit_code, t.retry_count + 1,
+        )
+
+        # 清空当前 coding workspace，递增轮次（生成唯一 Workspace 标题）
+        t.coding_workspace_id = None
+        t.coding_branch = None
+        t.coding_round = (t.coding_round or 1) + 1
+        t.retry_count += 1
+        t.stuck_since = None
+        self._action_start_coding(issue_id, issue, trace_id, extra_context=extra_context)
+
+    def _handle_review_stuck(self, issue_id: str, issue: dict, trace_id: str):
+        """处理 review session 结论未写入 issue.status 的情况：重试或标记 Blocked。"""
+        t = self._trackers[issue_id]
+        if t.retry_count >= self.config.max_review_retries:
+            self._mark_blocked(
+                issue_id, trace_id,
+                f"review session 完成后 issue.status 未变化，已重试 {t.retry_count} 次",
+            )
+            return
+
+        logger.warning(
+            "[%s] ⚠️ %s: 重建 review session（第 %d 次重试）",
+            trace_id, t.simple_id, t.retry_count + 1,
+        )
+        t.review_workspace_id = None
+        t.review_branch = None
+        t.retry_count += 1
+        t.stuck_since = None
+        self._action_start_review(issue_id, issue, trace_id)
+
+    def _extract_review_feedback(self, description: str) -> str:
+        """从 issue.description 中提取最后一个 '## Review Feedback' 段落。
+
+        Reviewer Agent 通过 update_issue MCP 工具将审查反馈追加到 issue.description 末尾，
+        格式为:
+            ## Review Feedback (Round N)
+            - 文件: xxx | 问题: xxx | 建议: xxx
+
+        取最后一个出现的段落（支持多轮审查）。
+        """
+        if not description:
+            return ""
+        marker = "## Review Feedback"
+        idx = description.rfind(marker)
+        if idx == -1:
+            return ""
+        return description[idx:].strip()
+
+    def _mark_blocked(self, issue_id: str, trace_id: str, reason: str):
+        """将 Issue 标记为 Blocked，停止自动处理，等待人工介入。"""
+        t = self._trackers[issue_id]
+        t.stuck_reason = reason
+        self.rest.update_issue_status(issue_id, "Blocked", self.config.status_map)
+        t.status = "Blocked"
+        self._save_state()
+        logger.error(
+            "[%s] 🚫 BLOCKED: %s「%s」— %s\n"
+            "      请人工介入后，手动将 Issue 状态改回 In progress 或 To do 重新触发流程。",
+            trace_id, t.simple_id, t.title[:40], reason,
+        )
+
+    def _is_review_status_wait_timed_out(self, t: "IssueTracker") -> bool:
+        """检查等待 review 结论写入 issue.status 是否已超时。"""
+        if not t.stuck_since:
+            return False
+        try:
+            since = datetime.fromisoformat(t.stuck_since.replace("Z", "+00:00"))
+            if since.tzinfo is None:
+                since = since.replace(tzinfo=UTC)
+            elapsed = datetime.now(UTC) - since
+            return elapsed.total_seconds() > self.config.max_review_wait_minutes * 60
+        except (ValueError, TypeError):
+            return False
 
     # ---- 编排动作 ----
 
@@ -490,6 +613,9 @@ class Dispatcher:
         approved: bool,
     ):
         """审查结论已确定 → 根据结论流转状态。
+
+        注意：此方法现在仅处理 approved=True 的情况（PR merge）。
+        CHANGES_REQUESTED 由 issue.status 变化 In progress 直接触发，不再经过此方法。
 
         approved=True  → Done  → 触发 PR merge
         approved=False → In progress → 重置审查状态，重新创建编码 Session
@@ -504,6 +630,8 @@ class Dispatcher:
         # 清空审查 Session（无论通过还是打回）
         t.review_workspace_id = None
         t.review_branch = None
+        t.stuck_since = None
+        t.retry_count = 0
 
         if approved:
             self.rest.update_issue_status(issue_id, "Done", self.config.status_map)
@@ -515,27 +643,20 @@ class Dispatcher:
             if self.config.auto_merge:
                 self._action_merge_pr(issue_id, trace_id)
         else:
-            # CHANGES_REQUESTED：清空编码 Session，重新创建
-            # 1. 在清空 review_branch 前，先从 SQLite 读取审查反馈（供下一轮编码 Agent 参考）
-            if t.review_branch:
-                fb = self.vk_db.get_review_summary(t.review_branch)
-                t.review_feedback = fb or ""
-            # 2. 递增编码轮次（使 _action_start_coding 生成唯一标题，避免幂等检查复用旧 Workspace）
+            # CHANGES_REQUESTED：从 issue.description 读取审查反馈（基础设施级信号）
+            feedback = self._extract_review_feedback(issue.get("description") or "")
+            t.review_feedback = feedback
+            # 递增编码轮次（使 _action_start_coding 生成唯一标题）
             t.coding_round = (t.coding_round or 1) + 1
-            # 3. 清空会话状态
             t.coding_workspace_id = None
             t.coding_branch = None
-            t.review_workspace_id = None
-            t.review_branch = None
             self.rest.update_issue_status(issue_id, "In progress", self.config.status_map)
             t.status = "In progress"
             self._action_count += 1
             self._save_state()
             logger.info(
                 "[%s] %s: 审查打回 → In progress，重启第 %d 轮编码",
-                trace_id,
-                t.simple_id,
-                t.coding_round,
+                trace_id, t.simple_id, t.coding_round,
             )
             self._action_start_coding(issue_id, issue, trace_id)
 
@@ -601,8 +722,12 @@ class Dispatcher:
         finally:
             mcp.close()
 
-    def _action_start_coding(self, issue_id: str, issue: dict, trace_id: str):
-        """动作: 创建编码 Session + 状态 → In progress"""
+    def _action_start_coding(self, issue_id: str, issue: dict, trace_id: str, extra_context: str | None = None):
+        """动作: 创建编码 Session + 状态 → In progress
+
+        Args:
+            extra_context: 额外信息（如重试原因、上次错误），注入到 prompt 开头优先展示
+        """
         if self.dry_run:
             logger.info("[%s] [DRY-RUN] 跳过创建编码 Session", trace_id)
             return
@@ -613,7 +738,7 @@ class Dispatcher:
         # Round 2+ 时在标题中加入轮次号，避免幂等检查误命中上一轮已完成的 Workspace
         if (t.coding_round or 1) > 1:
             title = f"{title} [Round {t.coding_round}]"
-        prompt = self._build_coding_prompt(issue, t)
+        prompt = self._build_coding_prompt(issue, t, extra_context=extra_context)
 
         # ---- 幂等检查: 若已存在同名 workspace，直接复用 ----
         existing = self.rest.find_workspace_by_title(title)
@@ -768,11 +893,12 @@ class Dispatcher:
         existing = self.rest.find_workspace_by_title(title)
         if existing:
             existing_branch = existing.get("branch")
-            # 若旧 review workspace 已有审查结论，且已启动过，新建下一轮审查 Workspace
+            # 若旧 review workspace 已有明确结论（exit_code 非空），且已启动过，新建下一轮审查 Workspace
+            # 使用 is_qg_passed(非 None) 作为"已完成"的基础设施级信号，取代已废弃的 is_review_done
             if (
                 existing_branch
                 and existing.get("container_ref")
-                and self.vk_db.is_review_done(existing_branch) is not None
+                and self.vk_db.is_qg_passed(existing_branch) is not None
             ):
                 round_num = 2
                 new_title = f"Review: {base_branch} (round{round_num}) ({reviewer})"
@@ -1103,24 +1229,22 @@ class Dispatcher:
     # ---- 辅助方法 ----
 
     def _build_coding_prompt(
-        self, issue: dict, tracker: "IssueTracker | None" = None
+        self, issue: dict, tracker: "IssueTracker | None" = None, extra_context: str | None = None
     ) -> str | None:
         """构建编码 prompt: 工作流规范 + 项目规范 + Issue 完整上下文 [+ 审查反馈]
 
         注入顺序（从宏观到具体）:
+        0. extra_context  — 重试原因、上次错误（最高优先级，注入开头）
         1. coder.md       — 工作流规范和角色职责（通用）
         2. CLAUDE.md      — 项目编码规范、技术栈、约束（项目级）
         3. Issue 上下文   — simple_id / title / description（任务级）
-        4. 审查反馈（可选）— 上一轮 CHANGES_REQUESTED 时审查 Agent 的意见（多轮时）
-
-        Agent（Claude Code / Codex 等）收到后会:
-        - 根据 Issue 描述理解任务目标
-        - 根据 CLAUDE.md 约束遵守项目规范
-        - 自行读取代码库找到相关文件（无需 Dispatcher 推断）
+        4. 审查反馈（可选）— 上一轮 CHANGES_REQUESTED 时 Reviewer 写入 issue.description 的反馈
         """
         parts: list[str] = []
 
-        # 1. 工作流规范（coder.md）
+        # 0. 重试原因（最高优先级）
+        if extra_context:
+            parts.append(f"## ⚠️ 重要提示（请优先处理）\n\n{extra_context}")
         coder_prompt = self._load_prompt(self.config.coding_prompt_file)
         if coder_prompt:
             parts.append(coder_prompt)
@@ -1144,7 +1268,7 @@ class Dispatcher:
 
         parts.append(issue_section)
 
-        # 4. 上一轮审查反馈（CHANGES_REQUESTED 重新编码时注入）
+        # 4. 上一轮审查反馈（Reviewer Agent 通过 MCP 写入 issue.description，Dispatcher 读取后注入）
         if tracker and tracker.review_feedback:
             round_num = getattr(tracker, "coding_round", 1)
             parts.append(
@@ -1175,14 +1299,13 @@ class Dispatcher:
         return "\n\n---\n\n".join(parts)
 
     def _build_review_prompt(self, tracker: IssueTracker, trace_id: str) -> str | None:
-        """构建增强审查 prompt: 基础 prompt + PR 信息 + diff 范围
+        """构建增强审查 prompt: 基础 prompt + PR 信息 + diff 范围 + MCP 完成指令
 
         审查 Agent 需要知道:
         1. PR URL（直接查看）
         2. diff 范围（应该审查哪些文件）
         3. 变更统计（影响范围）
-
-        注：状态更新由 Dispatcher E45 负责，不在 prompt 中注入 curl 指令。
+        4. 如何通过 MCP 工具通知系统审查结论（基础设施级信号）
         """
         # 加载基础 prompt
         base_prompt = self._load_prompt(self.config.review_prompt_file) or ""
@@ -1209,14 +1332,40 @@ class Dispatcher:
                     f"审查命令: `git diff {self.config.main_branch}...{tracker.coding_branch}`\n"
                 )
 
-        # 注意：审查完成后的 Issue 状态更新由 Dispatcher E45 负责（读 SQLite summary 检测结论），
-        # 不再要求 reviewer agent 执行 curl PATCH，避免 agent 越权触发额外编码 session。
+        # MCP 完成指令：始终追加，不受基础 prompt 截断影响
+        # Reviewer Agent 必须调用 update_issue MCP 工具才能触发 Dispatcher 状态流转
+        mcp_section = (
+            "\n\n---\n\n"
+            "## ⚠️ 审查完成方式（系统要求，必须执行）\n\n"
+            "你的自然语言输出**不会**被系统读取。\n"
+            "审查结论必须通过 MCP 工具写入 VK Issue，才能触发自动化流程。\n\n"
+            "**步骤 1：** 调用 `get_context` 获取当前 Issue 的 `issue_id`\n\n"
+            "**步骤 2：** 根据审查结论执行对应操作：\n\n"
+            "审查通过（APPROVED）：\n"
+            "```\n"
+            "update_issue(issue_id=<从 get_context 获取>, status=\"Done\")\n"
+            "```\n\n"
+            "审查不通过（CHANGES_REQUESTED）：\n"
+            "```\n"
+            "# 先获取当前 description\n"
+            "issue = get_issue(issue_id=<从 get_context 获取>)\n\n"
+            "# 追加审查反馈到 description 末尾\n"
+            "new_description = issue.description + \"\"\"\n\n"
+            "## Review Feedback\n"
+            "- 文件: <文件路径> | 问题: <具体问题> | 建议: <修改建议>\n"
+            "- ...\n"
+            "\"\"\"\n\n"
+            "# 一次调用同时更新 description 和 status\n"
+            "update_issue(issue_id=<从 get_context 获取>, description=new_description, status=\"In progress\")\n"
+            "```\n\n"
+            "> 注意：`status` 的值必须与项目中状态名称完全一致（区分大小写）。\n"
+        )
 
         if not pr_section and not diff_section:
-            return base_prompt[:5000] if base_prompt else None
+            return (base_prompt[:6000] if base_prompt else "") + mcp_section or None
 
-        enhanced = base_prompt + pr_section + diff_section
-        return enhanced[:5000]
+        enhanced = base_prompt[:6000] + pr_section + diff_section + mcp_section
+        return enhanced
 
     def _pull_main(self, trace_id: str):
         """合并后拉取最新主分支到本地"""
@@ -1579,6 +1728,10 @@ class Dispatcher:
                 flags.append(f"review={t.review_workspace_id[:8]}")
             if t.merged:
                 flags.append("merged ✓")
+            if t.stuck_reason:
+                flags.append(f"STUCK:{t.stuck_reason[:30]}")
+            if t.retry_count:
+                flags.append(f"retry={t.retry_count}")
             flag_str = f" [{', '.join(flags)}]" if flags else ""
 
             lines.append(f"  {t.simple_id:8s} {t.status:12s} {t.title[:40]}{flag_str}")

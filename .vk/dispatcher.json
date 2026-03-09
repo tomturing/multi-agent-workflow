@@ -24,5 +24,10 @@
         "GEMINI": "CODEX"
     },
     "coding_prompt_file": ".vk/prompts/coder.md",
-    "review_prompt_file": ".vk/prompts/reviewer.md"
+    "review_prompt_file": ".vk/prompts/reviewer.md",
+
+    "max_coding_retries": 2,
+    "max_review_retries": 2,
+    "max_coding_wait_minutes": 60,
+    "max_review_wait_minutes": 15
 }

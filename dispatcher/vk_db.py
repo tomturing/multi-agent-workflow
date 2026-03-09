@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from typing import Optional
 
 logger = logging.getLogger("dispatcher")
@@ -329,142 +330,41 @@ class VKDatabase:
             logger.debug("VKDatabase.get_worktree_path: 查询失败 (branch=%s): %s", branch, e)
             return None
 
-    def is_review_done(self, review_branch: str) -> "str | bool | None":
-        """检测审查 Agent 是否完成，并返回审查结论。
+    def is_coding_timed_out(self, branch: str, max_minutes: int) -> bool:
+        """检测编码 Agent 是否超时（exit_code 为 null 且违背 max_minutes 阈值）。
 
-        检测逻辑：
-        1. 确认审查 codingagent 已完成（exit_code=0）
-        2. 读取 coding_agent_turns.summary，查找标准结论标记：
-           - 包含 'APPROVED'            → 审查通过
-           - 包含 'CHANGES_REQUESTED'   → 需要修改
-        3. 若 codingagent 失败（exit_code IS NOT NULL AND exit_code != 0）→ False
-        4. 仍在运行 / 尚未启动 / 无法判断 → None
-
-        存储位置（源码已验证）：
-          VK 自动将 Agent 最终输出截取存入 coding_agent_turns.summary，
-          无需 Agent 主动触发，是可信的权威来源。
+        用于悲观等待范式的 STUCK 检测：若 codingagent 或 cleanupscript 的最新
+        进程记录显示仍在运行（exit_code=NULL）且超过阈值，则认定超时。
 
         Returns:
-            'approved'           — 审查通过，可流转 Done
-            'changes_requested'  — 审查打回，可流转 In progress
-            'unknown'            — 结论未知，转交调度器判定（常用于流转回 In progress 等待人工）
-            False                — Agent 真实失败，等待人工介入
-            None                 — 仍在运行 / 尚未开始 / 无法判断
+            True  — 超时（Agent 应该被认为已广死）
+            False — 未超时 / 无记录 / 已有明确 exit_code（该情况由 is_qg_passed 处理）
         """
-        # 先检查 codingagent 进程是否完成
-        proc = self.get_latest_process(review_branch, RUN_REASON_CODING_AGENT)
-        if proc is None:
-            logger.debug("VKDatabase.is_review_done: 分支 %s 无进程记录", review_branch)
-            return None
-
-        agent_eval = self._evaluate_process(proc, "review-codingagent", review_branch)
-        if agent_eval is None:
-            # 仍在运行或 VK 重启 artifact
-            return None
-        if agent_eval is False:
-            # 真实失败
-            return False
-
-        # codingagent 已成功完成，读取 summary 判断结论
-        sql = """
-            SELECT cat.summary
-            FROM coding_agent_turns cat
-            JOIN execution_processes ep ON cat.execution_process_id = ep.id
-            JOIN sessions s ON ep.session_id = s.id
-            JOIN workspaces w ON s.workspace_id = w.id
-            WHERE w.branch = ?
-              AND ep.run_reason = ?
-              AND ep.dropped = FALSE
-              AND cat.summary IS NOT NULL
-              AND cat.summary != ''
-            ORDER BY cat.created_at DESC
-            LIMIT 1
-        """
-        try:
-            conn = self._connect()
+        # 优先检查 cleanup，它是最终状态判断来源
+        for run_reason in (RUN_REASON_CLEANUP_SCRIPT, RUN_REASON_CODING_AGENT):
+            proc = self.get_latest_process(branch, run_reason)
+            if proc is None:
+                continue
+            if proc["exit_code"] is not None:
+                # 已有明确结果，不算超时（由 is_qg_passed 处理）
+                return False
+            # exit_code=NULL，进程仍运行中，检查 started_at
+            started_at_str = proc.get("started_at")
+            if not started_at_str:
+                return False
             try:
-                cursor = conn.execute(sql, (review_branch, RUN_REASON_CODING_AGENT))
-                row = cursor.fetchone()
-                if row is None:
-                    logger.debug(
-                        "VKDatabase.is_review_done: 分支 %s codingagent 已完成但无 summary",
-                        review_branch,
+                # SQLite 存储为 ISO 字符串，可能带小数秒
+                started_at = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+                if started_at.tzinfo is None:
+                    started_at = started_at.replace(tzinfo=UTC)
+                elapsed = datetime.now(UTC) - started_at
+                if elapsed > timedelta(minutes=max_minutes):
+                    logger.warning(
+                        "VKDatabase.is_coding_timed_out: 分支 %s %s 已运行 %.0f 分钟，超过阈值 %d 分钟，认定超时",
+                        branch, run_reason, elapsed.total_seconds() / 60, max_minutes,
                     )
-                    return None
-                summary = row[0]
-            finally:
-                conn.close()
-        except (FileNotFoundError, sqlite3.Error) as e:
-            logger.warning(
-                "VKDatabase.is_review_done: SQLite 查询失败 (branch=%s): %s", review_branch, e
-            )
-            return None
-
-        # 解析标准结论标记（不区分大小写）
-        summary_upper = summary.upper()
-        if "APPROVED" in summary_upper and "CHANGES_REQUESTED" not in summary_upper:
-            logger.info(
-                "VKDatabase.is_review_done: 分支 %s 审查通过 ✓ (summary 前100字: %s)",
-                review_branch,
-                summary[:100],
-            )
-            return "approved"
-        if "CHANGES_REQUESTED" in summary_upper:
-            logger.info(
-                "VKDatabase.is_review_done: 分支 %s 审查打回 (summary 前100字: %s)",
-                review_branch,
-                summary[:100],
-            )
-            return "changes_requested"
-
-        # summary 存在但不含标准标记 → 视作格式不合规的未知状态，返回 unknown 防止卡死
-        logger.warning(
-            "VKDatabase.is_review_done: 分支 %s summary 无标准结论标记，按照未知(unknown)处理 (summary 前100字: %s)",
-            review_branch,
-            summary[:100],
-        )
-        return "unknown"
-
-    def get_review_summary(self, review_branch: str) -> str | None:
-        """读取审查 Agent 的完整 summary 文本，用于传递给下一轮编码 Agent。
-
-        与 is_review_done 使用相同的 SQL，但直接返回原始 summary 字符串
-        （含审查意见全文，而非解析结论标记）。
-
-        Returns:
-            str:  summary 原文（可能较长）
-            None: 无记录 / SQLite 不可用 / 查询失败
-        """
-        if not os.path.exists(self._db_path):
-            return None
-
-        sql = """
-            SELECT cat.summary
-            FROM coding_agent_turns cat
-            JOIN execution_processes ep ON cat.execution_process_id = ep.id
-            JOIN sessions s ON ep.session_id = s.id
-            JOIN workspaces w ON s.workspace_id = w.id
-            WHERE w.branch = ?
-              AND ep.run_reason = 'codingagent'
-              AND ep.dropped = FALSE
-              AND cat.summary IS NOT NULL AND cat.summary != ''
-            ORDER BY cat.created_at DESC
-            LIMIT 1
-        """
-        try:
-            conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, timeout=5.0)
-            try:
-                cur = conn.execute(sql, (review_branch,))
-                row = cur.fetchone()
-                if row is None:
-                    return None
-                return row[0]
-            finally:
-                conn.close()
-        except (FileNotFoundError, sqlite3.Error) as e:
-            logger.warning(
-                "VKDatabase.get_review_summary: SQLite 查询失败 (branch=%s): %s",
-                review_branch,
-                e,
-            )
-            return None
+                    return True
+            except (ValueError, TypeError) as e:
+                logger.debug("VKDatabase.is_coding_timed_out: 时间解析失败 (%s): %s", branch, e)
+            return False  # 找到最新进程记录，不再继续查找
+        return False
