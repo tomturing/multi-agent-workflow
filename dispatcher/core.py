@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import subprocess
 import time
 import uuid
@@ -218,6 +219,15 @@ class Dispatcher:
         # VK REST API 返回 status_id，不返回状态名称
         self._status_id_to_name: dict[str, str] = {v: k for k, v in config.status_map.items()}
 
+        # multi-agent-workflow 仓库路径（用于 state git 同步 + pitfalls 共享）
+        maw_dir_file = os.path.join(config.project_dir, ".vk", "maw_dir")
+        self._maw_dir: str | None = None
+        if os.path.isfile(maw_dir_file):
+            try:
+                self._maw_dir = open(maw_dir_file).read().strip() or None
+            except Exception:
+                pass
+
         self._load_state()
 
     # ---- 主循环 ----
@@ -265,6 +275,9 @@ class Dispatcher:
         if not self.rest.health_check():
             logger.warning("VK 服务当前不可达，跳过本次轮询")
             return
+
+        # 多设备并行时，先拉取其他设备的最新 state
+        self._sync_state_pull()
 
         trace_id = uuid.uuid4().hex[:6]
         self._poll_count += 1
@@ -733,6 +746,15 @@ class Dispatcher:
             return
 
         t = self._trackers[issue_id]
+
+        # 多设备防重复认领：若已被其他设备认领，则跳过
+        current_host = socket.gethostname()
+        if t.claimed_by and t.claimed_by != current_host:
+            logger.info(
+                "[%s] 跳过 %s 的编码认领，已被其他设备认领: %s",
+                trace_id, t.simple_id, t.claimed_by,
+            )
+            return
         executor = self.config.default_coder_executor
         title = issue.get("title", t.simple_id)
         # Round 2+ 时在标题中加入轮次号，避免幂等检查误命中上一轮已完成的 Workspace
@@ -756,6 +778,7 @@ class Dispatcher:
             t.coding_workspace_id = ws_id
             t.coding_branch = branch
             t.coder_executor = executor
+            t.claimed_by = socket.gethostname()  # 记录认领设备
             self._action_count += 1
             self.rest.update_issue_status(issue_id, "In progress", self.config.status_map)
             t.status = "In progress"
@@ -795,6 +818,7 @@ class Dispatcher:
             t.coding_workspace_id = ws_id
             t.coding_branch = branch
             t.coder_executor = executor
+            t.claimed_by = socket.gethostname()  # 记录认领设备
             self._action_count += 1
 
             # 状态 → In progress
@@ -1693,7 +1717,7 @@ class Dispatcher:
             logger.info("启动校验完成: 所有 workspace 引用有效 ✓")
 
     def _save_state(self):
-        """持久化调度状态到 JSON 文件"""
+        """持久化调度状态到 JSON，并同步到 multi-agent-workflow 仓库（多设备共享）"""
         data = {
             "issues": {k: asdict(v) for k, v in self._trackers.items()},
             "updated_at": datetime.now(UTC).isoformat(),
@@ -1704,6 +1728,53 @@ class Dispatcher:
         os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
         with open(self._state_file, "w") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+        self._sync_state_push()
+
+    def _sync_state_pull(self):
+        """轮询前从远端拉取最新 state（多设备并行时获取其他设备的动作）"""
+        if not self._maw_dir:
+            return
+        try:
+            subprocess.run(
+                ["git", "-C", self._maw_dir, "pull", "--rebase", "--autostash"],
+                capture_output=True, text=True, timeout=10,
+            )
+            # 重载 state（其他设备可能更新了 claimed_by 等字段）
+            self._load_state()
+        except Exception as e:
+            logger.debug("同步 state pull 失败（不影响主流程）: %s", e)
+
+    def _sync_state_push(self):
+        """_save_state 后将 state 文件备份到 maw_dir 并 commit + push（多设备共享）"""
+        if not self._maw_dir:
+            return
+        # 将 state 文件备份到 maw_dir/.vk/state_<project>.json
+        project_name = os.path.basename(self.config.project_dir)
+        shared_state = os.path.join(self._maw_dir, ".vk", f"state_{project_name}.json")
+        try:
+            import shutil
+            os.makedirs(os.path.dirname(shared_state), exist_ok=True)
+            shutil.copy2(self._state_file, shared_state)
+            result = subprocess.run(
+                ["git", "-C", self._maw_dir, "diff", "--quiet", "--", shared_state],
+                capture_output=True,
+            )
+            if result.returncode != 0:  # 有变更才提交
+                subprocess.run(
+                    ["git", "-C", self._maw_dir, "add", shared_state],
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "-C", self._maw_dir, "commit", "-m",
+                     f"state: {project_name} [{socket.gethostname()}]"],
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "-C", self._maw_dir, "push"],
+                    capture_output=True, timeout=15,
+                )
+        except Exception as e:
+            logger.debug("同步 state push 失败（不影响主流程）: %s", e)
 
     # ---- 状态查询（供 CLI status 命令使用）----
 

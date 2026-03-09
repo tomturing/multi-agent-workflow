@@ -18,6 +18,9 @@
 - **并行隔离**: Git Worktree 隔离各 Agent 工作分支，互不干扰
 - **质量门禁**: 自动 lint + 测试 + 冲突检测，合并前必须通过
 - **智能注入**: 对已有项目不覆盖现有文件，安全追加
+- **通用 Agent 支持**: `AGENTS.md` 为所有 Agent 可读的真实文件，`CLAUDE.md` 是其符号链接
+- **跨设备经验同步**: `agent-global/pitfalls/` 集中存放避坑指南，通过 git 自动同步到每台设备
+- **多设备防重认领**: Dispatcher 使用 `claimed_by` 字段标记认领设备，避免多设备重复启动同一任务
 
 ## 架构
 
@@ -64,8 +67,11 @@
 # 克隆模板仓库
 git clone <this-repo> ~/Workflow/multi-agent-workflow
 
-# 初始化新项目（交互式问答）
+# 【首次使用】初始化本机 Agent 环境（创建 pitfalls 符号链接）
 cd ~/Workflow/multi-agent-workflow
+bash init.sh --setup-agents
+
+# 初始化新项目（交互式问答）
 bash init.sh -p my-new-project
 
 # 非交互模式（生成 TODO 占位符，稍后手动填写）
@@ -84,8 +90,8 @@ bash init.sh -p existing-project
 ```bash
 cd ~/Workflow/my-new-project
 
-# 1. 检查并完善 CLAUDE.md 中的 TODO 项
-vim CLAUDE.md
+# 1. 检查并完善 AGENTS.md 中的 TODO 项（CLAUDE.md 是其符号链接，编辑任意一个均可）
+vim AGENTS.md
 
 # 2. 启动 Vibe Kanban
 make vk    # 或 npx vibe-kanban
@@ -104,17 +110,29 @@ git add . && git commit -m "初始化多 Agent 工作流"
 ```
 multi-agent-workflow/
 ├── README.md                       # 本文件
-├── init.sh                         # 初始化入口脚本
+├── init.sh                         # 初始化入口脚本（含 --setup-agents 本机初始化）
+├── agent-global/                   # 全局/跨设备共享知识库
+│   └── pitfalls/                   # 避坑指南（git 同步，symlink 到 ~/.claude/pitfalls/）
+│       ├── debugging.md
+│       ├── dispatcher.md
+│       ├── frontend.md
+│       ├── grafana.md
+│       ├── k8s.md
+│       ├── network-service-check.md
+│       ├── openclaw.md
+│       ├── python.md
+│       └── shell.md
 ├── dispatcher/                     # 中央调度器（Python 模块）
 │   ├── __init__.py
 │   ├── __main__.py                 # CLI: python -m dispatcher
-│   ├── core.py                     # 轮询引擎 + 状态机 + 编排动作
+│   ├── core.py                     # 轮询引擎 + 状态机 + 编排动作（含多设备 claimed_by）
 │   ├── github.py                   # GitHub REST API v3 客户端（PR 生命周期）
 │   └── vk.py                       # VK REST API + MCP stdio 客户端
 ├── templates/
-│   ├── CLAUDE.md.tmpl              # 项目 CLAUDE.md 模板（含占位符变量）
+│   ├── AGENTS.md.tmpl              # 项目 AGENTS.md 模板（通用 Agent 规范，含占位符变量）
+│   ├── CLAUDE.md.tmpl              # 旧模板（保留兼容性，新项目使用 AGENTS.md.tmpl）
 │   ├── gitignore.append            # .gitignore 追加内容
-│   ├── Makefile.append             # Makefile 追加内容
+│   ├── Makefile.append             # Makefile 追加内容（含 sync-knowledge 目标）
 │   └── vk/
 │       ├── workflow.md             # 通用工作流规范（§1-§9）
 │       ├── dispatcher.json         # 调度器配置模板
@@ -126,7 +144,7 @@ multi-agent-workflow/
 │           └── .gitignore
 └── scripts/
     ├── agent-quality-gate.sh       # 质量门禁脚本
-    ├── vk-hooks.sh                 # VK 状态流转钩子（阶段感知）
+    ├── vk-hooks.sh                 # VK 状态流转钩子（含 pitfalls 自动同步）
     ├── check-worktree-conflicts.sh # Worktree 冲突检测脚本
     └── post-merge-verify.sh        # 合并后验证脚本
 ```
@@ -135,8 +153,8 @@ multi-agent-workflow/
 
 ```
 my-project/
-├── CLAUDE.md              # 项目规范（Agent 阅读的核心文件）
-├── AGENTS.md              # 符号链接 → CLAUDE.md
+├── AGENTS.md              # 项目规范（所有 Agent 通用，提交 git 团队共享）
+├── CLAUDE.md              # 符号链接 → AGENTS.md（Claude Code 兼容）
 ├── CLAUDE.local.md        # 个人本地配置（不提交 git）
 ├── .vscode/
 │   └── mcp.json           # VS Code MCP Server 配置（VK 连接）
@@ -220,6 +238,7 @@ make dispatcher-status # 查看调度状态
 make quality-gate      # 运行质量门禁
 make conflict-check    # 检测 worktree 冲突
 make post-merge        # 合并后验证
+make sync-knowledge    # 同步 agent-global/pitfalls/ 到远端（多设备共享经验）
 ```
 
 ## 自定义
@@ -235,8 +254,10 @@ make post-merge        # 合并后验证
 ### 文件层级覆盖
 
 ```
-~/.claude/CLAUDE.md          ← 全局个人规范（全局生效）
-./CLAUDE.md                  ← 项目规范（提交 git，团队共享）
+~/.claude/CLAUDE.md          ← 全局个人规范（全局生效，Claude Code only）
+~/.claude/pitfalls/          ← 符号链接 → agent-global/pitfalls/（git 同步，跨设备共享）
+./AGENTS.md                  ← 项目规范真实文件（提交 git，所有 Agent 通用）
+./CLAUDE.md                  ← 符号链接 → AGENTS.md（Claude Code 兼容层）
 ./CLAUDE.local.md            ← 个人定制（不提交 git）
 ./.vk/workflow.md            ← 通用工作流（提交 git）
 ./.vk/prompts/*.md           ← Agent 提示词（提交 git）

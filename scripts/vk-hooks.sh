@@ -183,6 +183,9 @@ vk_on_cleanup_success() {
             else
                 _vk_update_issue_status "$issue_id" "In review" || true
             fi
+
+            # 自动同步新增 pitfalls 经验到 multi-agent-workflow 仓库
+            _vk_sync_pitfalls
             ;;
     esac
 }
@@ -201,6 +204,31 @@ vk_on_cleanup_failure() {
     echo -e "\n  \033[0;34m▸ VK 工作流钩子: cleanup 失败 (阶段: ${phase})\033[0m"
     # 失败时保持当前状态，不做额外操作
     echo -e "  Issue 保持当前状态"
+}
+
+# 自动提交并推送 agent-global/pitfalls/ 中的新增内容
+# 仅在有未提交变更时触发，避免冗余提交
+_vk_sync_pitfalls() {
+    local maw_dir
+    maw_dir=$(cat "${_VK_PROJECT_ROOT}/.vk/maw_dir" 2>/dev/null)
+    if [ -z "$maw_dir" ] || [ ! -d "$maw_dir" ]; then
+        return 0  # 未配置 maw_dir，跳过
+    fi
+
+    # 只检查 pitfalls 目录是否有变更
+    if git -C "$maw_dir" diff --quiet -- agent-global/pitfalls/ && \
+       git -C "$maw_dir" diff --cached --quiet -- agent-global/pitfalls/; then
+        return 0  # 无变更，跳过
+    fi
+
+    echo -e "  \033[0;34m▸ 检测到新 pitfalls 经验，自动同步...\033[0m"
+    if git -C "$maw_dir" add agent-global/pitfalls/ && \
+       git -C "$maw_dir" commit -m "自动：新增 pitfalls 经验 [$(hostname)/$(date +%Y%m%d)]" && \
+       git -C "$maw_dir" push; then
+        echo -e "  \033[0;32m✓\033[0m pitfalls 经验已同步到远端"
+    else
+        echo -e "  \033[1;33m⚠\033[0m pitfalls 同步失败（不影响主流程），请手动运行 make sync-knowledge"
+    fi
 }
 
 # 推送当前分支到 GitHub remote

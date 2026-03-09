@@ -3,6 +3,11 @@
 # 多 Agent 工作流命令（由 multi-agent-workflow init.sh 自动添加）
 # ============================================================================
 
+sync-knowledge:
+	@cd $(shell cat .vk/maw_dir 2>/dev/null || echo ~/Workflow/multi-agent-workflow) && \
+		git pull --rebase --autostash && git push && \
+		echo "✓ 经验库已同步"
+
 .PHONY: dev-up dev-down dev-logs vk vk-stop quality-gate conflict-check post-merge dispatcher-status dispatcher-once
 
 # VK 固定端口（避免每次重启端口变化导致 MCP 需要 Reload Window）

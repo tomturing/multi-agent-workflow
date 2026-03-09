@@ -8,7 +8,8 @@ CLAUDE.local.md
 
 # 运行时状态（不提交）
 .vk/github_token
-.vk/dispatcher_state.json
+# dispatcher_state.json 现由各设备 dispatcher 通过 git 同步，需入库（见 dispatcher/core.py _sync_state_push）
+# .vk/dispatcher_state.json  ← 已移除忽略，改为追踪 .vk/state_*.json
 .vk/logs/
 .vk/qg_passed/
 .vk/maw_dir

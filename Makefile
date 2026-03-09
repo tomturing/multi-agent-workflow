@@ -3,10 +3,12 @@
 # 多 Agent 工作流命令（由 multi-agent-workflow init.sh 自动添加）
 # ============================================================================
 
-.PHONY: vk vk-stop vk-restart quality-gate conflict-check post-merge dispatcher dispatcher-status
+.PHONY: vk vk-stop vk-restart quality-gate conflict-check post-merge dispatcher dispatcher-status sync-knowledge
 
 # VK 固定端口（避免每次重启端口变化导致 MCP 需要 Reload Window）
 VK_PORT ?= 9527
+# multi-agent-workflow 仓库自身路径
+SCRIPT_DIR := $(shell cd "$(dir $(abspath $(lastword $(MAKEFILE_LIST))))" && pwd)
 
 vk:
 	@echo "启动 Vibe Kanban（端口 $(VK_PORT)）..."
@@ -47,6 +49,9 @@ dispatcher-status:
 	VK_PORT=$(VK_PORT) python -m dispatcher --project-dir . status --cached
 
 # ── 守护启动（VK + Dispatcher 一键管理）──────────────────────────────────────
+sync-knowledge: ## 同步跨设备经验库（pull + push agent-global/pitfalls/）
+	@cd $(SCRIPT_DIR) && git pull --rebase --autostash && git push && echo "✓ 经验库已同步"
+
 maw-up: ## 一键启动 VK + Dispatcher（守护模式）
 	@bash .vk/dev.sh
 

@@ -32,9 +32,11 @@ usage() {
     echo -e "${BOLD}multi-agent-workflow init.sh${NC} — 初始化多 Agent 并行开发工作流"
     echo ""
     echo -e "用法: ${CYAN}bash init.sh -p <project-name>${NC} [选项]"
+    echo -e "       ${CYAN}bash init.sh --setup-agents${NC}"
     echo ""
     echo "选项:"
     echo "  -p, --project <name>    项目名称（在同级目录创建/查找项目目录）"
+    echo "  --setup-agents          一键初始化本机 Agent 环境（创建 ~/.claude/pitfalls 符号链接）"
     echo "  --non-interactive       非交互模式（使用 TODO 占位符，不询问）"
     echo "  -h, --help              显示帮助"
     echo ""
@@ -42,14 +44,20 @@ usage() {
     echo "  bash init.sh -p my-new-project          # 交互式创建新项目"
     echo "  bash init.sh -p existing-project         # 注入到已有项目"
     echo "  bash init.sh -p my-project --non-interactive  # 非交互模式"
+    echo "  bash init.sh --setup-agents             # 新设备接入时初始化 Agent 环境"
 }
 
 # ---- 参数解析 ----
+SETUP_AGENTS=false
 while [[ $# -gt 0 ]]; do
     case $1 in
         -p|--project)
             PROJECT_NAME="$2"
             shift 2
+            ;;
+        --setup-agents)
+            SETUP_AGENTS=true
+            shift
             ;;
         --non-interactive)
             NON_INTERACTIVE=true
@@ -67,6 +75,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# ---- --setup-agents 子命令：初始化本机 Agent 环境 ----
+if $SETUP_AGENTS; then
+    setup_agents
+    exit 0
+fi
+
 if [ -z "$PROJECT_NAME" ]; then
     echo -e "${RED}错误: 必须指定项目名称 (-p <name>)${NC}"
     usage
@@ -75,6 +89,43 @@ fi
 
 # ---- 项目目录 ----
 PROJECT_DIR="${WORKSPACE_DIR}/${PROJECT_NAME}"
+
+# ---- setup_agents: 初始化本机所有 Agent 的全局配置（每台设备执行一次）----
+setup_agents() {
+    log_header "setup-agents: 初始化本机 Agent 环境"
+    local pitfalls_src="${SCRIPT_DIR}/agent-global/pitfalls"
+
+    if [ ! -d "$pitfalls_src" ]; then
+        echo -e "  ${RED}错误: 找不到 ${pitfalls_src}，请确认 multi-agent-workflow 仓库完整${NC}"
+        exit 1
+    fi
+
+    # 创建 ~/.claude/pitfalls 符号链接（Claude Code 自动加载用）
+    mkdir -p ~/.claude
+    if [ -L ~/.claude/pitfalls ]; then
+        echo -e "  ${YELLOW}⛲${NC} ~/.claude/pitfalls 符号链接已存在，跳过"
+    elif [ -d ~/.claude/pitfalls ]; then
+        echo -e "  ${YELLOW}⛲${NC} ~/.claude/pitfalls 是真实目录，备份并替换为符号链接..."
+        mv ~/.claude/pitfalls ~/.claude/pitfalls.bak.$(date +%Y%m%d%H%M%S)
+        ln -sf "$pitfalls_src" ~/.claude/pitfalls
+        echo -e "  ${GREEN}✓${NC} ~/.claude/pitfalls → ${pitfalls_src}（原目录已备份）"
+    else
+        ln -sf "$pitfalls_src" ~/.claude/pitfalls
+        echo -e "  ${GREEN}✓${NC} ~/.claude/pitfalls → ${pitfalls_src}"
+    fi
+
+    # 将 multi-agent-workflow 路径写入 .vk/maw_dir（如果项目路径已知）
+    if [ -n "${PROJECT_NAME:-}" ] && [ -d "${WORKSPACE_DIR}/${PROJECT_NAME}/.vk" ]; then
+        echo "${SCRIPT_DIR}" > "${WORKSPACE_DIR}/${PROJECT_NAME}/.vk/maw_dir"
+        echo -e "  ${GREEN}✓${NC} .vk/maw_dir 已写入: ${SCRIPT_DIR}"
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}完成！${NC} Agent 环境初始化成功。"
+    echo "  以后在所有设备上执行此命令，就能自动共享最新经验库。"
+    echo "  手动同步: cd ${SCRIPT_DIR} && git pull && git push"
+    echo "  快速同步: make sync-knowledge"
+}
 
 # ---- 工具函数 ----
 
@@ -272,12 +323,14 @@ main() {
     # .vk/dispatcher.json 配置模板
     safe_copy "${TEMPLATE_DIR}/vk/dispatcher.json" ".vk/dispatcher.json"
 
-    # ---- Step 4: 生成 CLAUDE.md ----
-    log_header "Step 4: 生成 CLAUDE.md"
+    # ---- Step 4: 生成 AGENTS.md（通用项目规范，所有 Agent 的权威来源）----
+    log_header "Step 4: 生成 AGENTS.md"
 
-    if [ -f "CLAUDE.md" ]; then
-        log_skip "CLAUDE.md（已存在，不覆盖。如需重新生成，请先删除）"
+    if [ -f "AGENTS.md" ] && [ ! -L "AGENTS.md" ]; then
+        log_skip "AGENTS.md（已存在真实文件，不覆盖。如需重新生成，请先删除）"
     else
+        # 如果存在旧的 AGENTS.md symlink，删除它
+        [ -L "AGENTS.md" ] && rm AGENTS.md
         # 从模板生成，替换占位符
         if command -v python3 &>/dev/null; then
             python3 -c "
@@ -298,15 +351,14 @@ replacements = {
     '{{BUILD_COMMANDS}}': '''$(echo -e "$build_commands")''',
     '{{FORBIDDEN_OPERATIONS}}': '''$(echo -e "$forbidden_operations")''',
 }
-with open('${TEMPLATE_DIR}/CLAUDE.md.tmpl', 'r') as f:
+with open('${TEMPLATE_DIR}/AGENTS.md.tmpl', 'r') as f:
     content = f.read()
 for k, v in replacements.items():
     content = content.replace(k, v)
-with open('CLAUDE.md', 'w') as f:
+with open('AGENTS.md', 'w') as f:
     f.write(content)
 "
         else
-            # fallback: use sed for simple string ones, but it might break on special chars
             sed \
                 -e "s|{{PROJECT_NAME}}|${PROJECT_NAME}|g" \
                 -e "s|{{PROJECT_DESCRIPTION}}|${project_description}|g" \
@@ -318,20 +370,22 @@ with open('CLAUDE.md', 'w') as f:
                 -e "s|{{PACKAGE_MANAGERS}}|${package_managers}|g" \
                 -e "s|{{VK_SETUP_SCRIPT}}|${vk_setup_script}|g" \
                 -e "s|{{VK_DEV_SERVER}}|${vk_dev_server}|g" \
-                "${TEMPLATE_DIR}/CLAUDE.md.tmpl" > "CLAUDE.md"
+                "${TEMPLATE_DIR}/AGENTS.md.tmpl" > "AGENTS.md"
         fi
 
-        log_ok "生成 CLAUDE.md"
+        log_ok "生成 AGENTS.md"
     fi
 
-    # ---- Step 5: 创建 AGENTS.md 符号链接 ----
-    log_header "Step 5: AGENTS.md 符号链接"
+    # ---- Step 5: 创建 CLAUDE.md 符号链接 → AGENTS.md ----
+    log_header "Step 5: CLAUDE.md 符号链接"
 
-    if [ -f "AGENTS.md" ] || [ -L "AGENTS.md" ]; then
-        log_skip "AGENTS.md"
+    if [ -f "CLAUDE.md" ] && [ ! -L "CLAUDE.md" ]; then
+        log_skip "CLAUDE.md（已存在真实文件，保留，内容应与 AGENTS.md 一致）"
+    elif [ -L "CLAUDE.md" ]; then
+        log_skip "CLAUDE.md（符号链接已存在）"
     else
-        ln -s CLAUDE.md AGENTS.md
-        log_ok "创建 AGENTS.md → CLAUDE.md"
+        ln -s AGENTS.md CLAUDE.md
+        log_ok "创建 CLAUDE.md → AGENTS.md"
     fi
 
     # ---- Step 6: 创建 CLAUDE.local.md ----
@@ -400,8 +454,8 @@ LOCALEOF
     echo -e "  已初始化多 Agent 工作流到: ${GREEN}${PROJECT_DIR}${NC}"
     echo ""
     echo -e "  ${BOLD}创建的文件:${NC}"
-    echo "    CLAUDE.md              — 项目规范（请检查并完善 TODO 标注处）"
-    echo "    AGENTS.md              — 符号链接 → CLAUDE.md"
+    echo "    AGENTS.md              — 项目规范（所有 Agent 的权威来源，请检查并完善 TODO 标注处）"
+    echo "    CLAUDE.md              — 符号链接 → AGENTS.md（Claude Code 兼容）"
     echo "    CLAUDE.local.md        — 个人本地配置（不提交 git）"
     echo "    .vk/workflow.md        — 通用工作流规范"
     echo "    .vk/prompts/           — Agent 提示词模板"
@@ -411,7 +465,7 @@ LOCALEOF
     echo "    dispatcher/            — 中央调度器模块（自动化编排引擎）"
     echo ""
     echo -e "  ${BOLD}下一步:${NC}"
-    echo "    1. 检查 CLAUDE.md，完善所有 TODO 标注的项目定制内容"
+    echo "    1. 检查 AGENTS.md，完善所有 TODO 标注的项目定制内嬹"
     echo "    2. 按需修改 scripts/agent-quality-gate.sh 中的 lint/test 命令"
     echo "    3. 填写 .vk/dispatcher.json 中的 organization_id / project_id / repo_id"
     echo "    4. 填写 .vk/status_map.json（从 VK MCP list_issue_priorities 获取）"
