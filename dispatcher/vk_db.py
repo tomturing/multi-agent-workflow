@@ -361,7 +361,10 @@ class VKDatabase:
                 if elapsed > timedelta(minutes=max_minutes):
                     logger.warning(
                         "VKDatabase.is_coding_timed_out: 分支 %s %s 已运行 %.0f 分钟，超过阈值 %d 分钟，认定超时",
-                        branch, run_reason, elapsed.total_seconds() / 60, max_minutes,
+                        branch,
+                        run_reason,
+                        elapsed.total_seconds() / 60,
+                        max_minutes,
                     )
                     return True
             except (ValueError, TypeError) as e:

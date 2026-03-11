@@ -85,10 +85,10 @@ class DispatcherConfig:
     review_prompt_file: str = ".vk/prompts/reviewer.md"
 
     # ---- 可选: 悲观等待 / STUCK 阈值 ----
-    max_coding_retries: int = 2          # coding session 最大重试次数（超出后标记 Blocked）
-    max_review_retries: int = 2          # review session 最大重试次数
-    max_coding_wait_minutes: int = 60    # coding session 超时阈值（分钟）
-    max_review_wait_minutes: int = 15    # review session 完成后等待 issue.status 变化的超时（分钟）
+    max_coding_retries: int = 2  # coding session 最大重试次数（超出后标记 Blocked）
+    max_review_retries: int = 2  # review session 最大重试次数
+    max_coding_wait_minutes: int = 60  # coding session 超时阈值（分钟）
+    max_review_wait_minutes: int = 15  # review session 完成后等待 issue.status 变化的超时（分钟）
 
     # ---- 运行时加载 ----
     status_map: dict = field(default_factory=dict)
@@ -176,10 +176,10 @@ class IssueTracker:
     coding_round: int = 1  # 当前编码轮次（CHANGES_REQUESTED 后递增），用于生成唯一 Workspace 标题
     review_feedback: str = ""  # 上一轮审查反馈（从 issue.description 读取）
     # STUCK 状态跟踪（悲观等待范式）
-    stuck_reason: str | None = None   # 卡住的原因描述
-    retry_count: int = 0              # 当前阶段已重试次数
-    stuck_since: str | None = None    # 进入 STUCK 的时间戳（ISO 格式）
-    last_exit_code: int | None = None # 上次 coding/cleanup 失败的 exit_code（注入重试提示用）
+    stuck_reason: str | None = None  # 卡住的原因描述
+    retry_count: int = 0  # 当前阶段已重试次数
+    stuck_since: str | None = None  # 进入 STUCK 的时间戳（ISO 格式）
+    last_exit_code: int | None = None  # 上次 coding/cleanup 失败的 exit_code（注入重试提示用）
 
 
 # ============================================================================
@@ -445,7 +445,9 @@ class Dispatcher:
                 # exit_code=0 → QG 通过，流转 In review
                 logger.info(
                     "[%s] ▸ %s: QG 通过 (branch=%s)，移入 In review",
-                    trace_id, t.simple_id, t.coding_branch,
+                    trace_id,
+                    t.simple_id,
+                    t.coding_branch,
                 )
                 t.stuck_reason = None
                 t.retry_count = 0
@@ -457,7 +459,9 @@ class Dispatcher:
                 self._handle_coding_failure(issue_id, issue, trace_id)
             else:
                 # None → 仍在运行，检查是否超时
-                if self.vk_db.is_coding_timed_out(t.coding_branch, self.config.max_coding_wait_minutes):
+                if self.vk_db.is_coding_timed_out(
+                    t.coding_branch, self.config.max_coding_wait_minutes
+                ):
                     self._handle_coding_failure(issue_id, issue, trace_id, reason="超时")
             return
 
@@ -482,7 +486,9 @@ class Dispatcher:
                 if self._is_review_status_wait_timed_out(t):
                     logger.warning(
                         "[%s] ⚠️ STUCK: %s review agent 已完成但 issue.status 未变化，超时 %d 分钟，重建 review session",
-                        trace_id, t.simple_id, self.config.max_review_wait_minutes,
+                        trace_id,
+                        t.simple_id,
+                        self.config.max_review_wait_minutes,
                     )
                     self._handle_review_stuck(issue_id, issue, trace_id)
                 else:
@@ -491,13 +497,17 @@ class Dispatcher:
                         t.stuck_since = datetime.now(UTC).isoformat()
                         logger.info(
                             "[%s] %s: review agent 完成，等待 issue.status 变化... (最多 %d 分钟)",
-                            trace_id, t.simple_id, self.config.max_review_wait_minutes,
+                            trace_id,
+                            t.simple_id,
+                            self.config.max_review_wait_minutes,
                         )
             elif review_agent_done is False:
                 # Review agent 真实失败（exit_code!=0）
                 logger.warning(
                     "[%s] ⚠️ STUCK: %s review agent 失败 (branch=%s)",
-                    trace_id, t.simple_id, t.review_branch,
+                    trace_id,
+                    t.simple_id,
+                    t.review_branch,
                 )
                 self._handle_review_stuck(issue_id, issue, trace_id)
             # None → review agent 仍在运行，下轮再检查
@@ -521,14 +531,16 @@ class Dispatcher:
         if t.retry_count >= self.config.max_coding_retries:
             # 超过重试上限 → Blocked
             self._mark_blocked(
-                issue_id, trace_id,
+                issue_id,
+                trace_id,
                 f"coding {reason}，已重试 {t.retry_count} 次，超过上限 {self.config.max_coding_retries}",
             )
             return
 
         # 记录 exit_code 用于注入 extra_context
-        proc = self.vk_db.get_latest_process(t.coding_branch, "cleanupscript") or \
-               self.vk_db.get_latest_process(t.coding_branch, "codingagent")
+        proc = self.vk_db.get_latest_process(
+            t.coding_branch, "cleanupscript"
+        ) or self.vk_db.get_latest_process(t.coding_branch, "codingagent")
         if proc:
             t.last_exit_code = proc.get("exit_code")
 
@@ -540,7 +552,11 @@ class Dispatcher:
 
         logger.warning(
             "[%s] ⚠️ %s: coding %s (exit_code=%s)，第 %d 次重试，重建编码 Session",
-            trace_id, t.simple_id, reason, t.last_exit_code, t.retry_count + 1,
+            trace_id,
+            t.simple_id,
+            reason,
+            t.last_exit_code,
+            t.retry_count + 1,
         )
 
         # 清空当前 coding workspace，递增轮次（生成唯一 Workspace 标题）
@@ -556,14 +572,17 @@ class Dispatcher:
         t = self._trackers[issue_id]
         if t.retry_count >= self.config.max_review_retries:
             self._mark_blocked(
-                issue_id, trace_id,
+                issue_id,
+                trace_id,
                 f"review session 完成后 issue.status 未变化，已重试 {t.retry_count} 次",
             )
             return
 
         logger.warning(
             "[%s] ⚠️ %s: 重建 review session（第 %d 次重试）",
-            trace_id, t.simple_id, t.retry_count + 1,
+            trace_id,
+            t.simple_id,
+            t.retry_count + 1,
         )
         t.review_workspace_id = None
         t.review_branch = None
@@ -599,7 +618,10 @@ class Dispatcher:
         logger.error(
             "[%s] 🚫 BLOCKED: %s「%s」— %s\n"
             "      请人工介入后，手动将 Issue 状态改回 In progress 或 To do 重新触发流程。",
-            trace_id, t.simple_id, t.title[:40], reason,
+            trace_id,
+            t.simple_id,
+            t.title[:40],
+            reason,
         )
 
     def _is_review_status_wait_timed_out(self, t: "IssueTracker") -> bool:
@@ -669,7 +691,9 @@ class Dispatcher:
             self._save_state()
             logger.info(
                 "[%s] %s: 审查打回 → In progress，重启第 %d 轮编码",
-                trace_id, t.simple_id, t.coding_round,
+                trace_id,
+                t.simple_id,
+                t.coding_round,
             )
             self._action_start_coding(issue_id, issue, trace_id)
 
@@ -735,7 +759,9 @@ class Dispatcher:
         finally:
             mcp.close()
 
-    def _action_start_coding(self, issue_id: str, issue: dict, trace_id: str, extra_context: str | None = None):
+    def _action_start_coding(
+        self, issue_id: str, issue: dict, trace_id: str, extra_context: str | None = None
+    ):
         """动作: 创建编码 Session + 状态 → In progress
 
         Args:
@@ -752,7 +778,9 @@ class Dispatcher:
         if t.claimed_by and t.claimed_by != current_host:
             logger.info(
                 "[%s] 跳过 %s 的编码认领，已被其他设备认领: %s",
-                trace_id, t.simple_id, t.claimed_by,
+                trace_id,
+                t.simple_id,
+                t.claimed_by,
             )
             return
         executor = self.config.default_coder_executor
@@ -1367,20 +1395,20 @@ class Dispatcher:
             "**步骤 2：** 根据审查结论执行对应操作：\n\n"
             "审查通过（APPROVED）：\n"
             "```\n"
-            "update_issue(issue_id=<从 get_context 获取>, status=\"Done\")\n"
+            'update_issue(issue_id=<从 get_context 获取>, status="Done")\n'
             "```\n\n"
             "审查不通过（CHANGES_REQUESTED）：\n"
             "```\n"
             "# 先获取当前 description\n"
             "issue = get_issue(issue_id=<从 get_context 获取>)\n\n"
             "# 追加审查反馈到 description 末尾\n"
-            "new_description = issue.description + \"\"\"\n\n"
+            'new_description = issue.description + """\n\n'
             "## Review Feedback\n"
             "- 文件: <文件路径> | 问题: <具体问题> | 建议: <修改建议>\n"
             "- ...\n"
-            "\"\"\"\n\n"
+            '"""\n\n'
             "# 一次调用同时更新 description 和 status\n"
-            "update_issue(issue_id=<从 get_context 获取>, description=new_description, status=\"In progress\")\n"
+            'update_issue(issue_id=<从 get_context 获取>, description=new_description, status="In progress")\n'
             "```\n\n"
             "> 注意：`status` 的值必须与项目中状态名称完全一致（区分大小写）。\n"
         )
@@ -1737,7 +1765,9 @@ class Dispatcher:
         try:
             subprocess.run(
                 ["git", "-C", self._maw_dir, "pull", "--rebase", "--autostash"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             # 重载 state（其他设备可能更新了 claimed_by 等字段）
             self._load_state()
@@ -1753,6 +1783,7 @@ class Dispatcher:
         shared_state = os.path.join(self._maw_dir, ".vk", f"state_{project_name}.json")
         try:
             import shutil
+
             os.makedirs(os.path.dirname(shared_state), exist_ok=True)
             shutil.copy2(self._state_file, shared_state)
             result = subprocess.run(
@@ -1765,13 +1796,20 @@ class Dispatcher:
                     capture_output=True,
                 )
                 subprocess.run(
-                    ["git", "-C", self._maw_dir, "commit", "-m",
-                     f"state: {project_name} [{socket.gethostname()}]"],
+                    [
+                        "git",
+                        "-C",
+                        self._maw_dir,
+                        "commit",
+                        "-m",
+                        f"state: {project_name} [{socket.gethostname()}]",
+                    ],
                     capture_output=True,
                 )
                 subprocess.run(
                     ["git", "-C", self._maw_dir, "push"],
-                    capture_output=True, timeout=15,
+                    capture_output=True,
+                    timeout=15,
                 )
         except Exception as e:
             logger.debug("同步 state push 失败（不影响主流程）: %s", e)
